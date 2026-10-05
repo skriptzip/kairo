@@ -12,7 +12,7 @@ pub enum LoginEvent {
 
 pub struct LoginView {
     server: Entity<InputState>,
-    username: Entity<InputState>,
+    email: Entity<InputState>,
     password: Entity<InputState>,
     invite: Entity<InputState>,
     register: bool,
@@ -34,11 +34,11 @@ impl LoginView {
             })
         };
         let server = field("Server", last_server, window, cx);
-        let username = field("Benutzername", last_user, window, cx);
+        let email = field("E-Mail-Adresse", last_user, window, cx);
         let invite = field("Einladungscode (falls erforderlich)", String::new(), window, cx);
         let password = cx.new(|cx| InputState::new(window, cx).placeholder("Passwort").masked(true));
 
-        let subscriptions = [&server, &username, &password, &invite]
+        let subscriptions = [&server, &email, &password, &invite]
             .into_iter()
             .map(|input| {
                 cx.subscribe_in(input, window, |this, _, ev: &InputEvent, window, cx| {
@@ -49,7 +49,7 @@ impl LoginView {
             })
             .collect();
 
-        Self { server, username, password, invite, register: false, busy: false, error: notice, _subscriptions: subscriptions }
+        Self { server, email, password, invite, register: false, busy: false, error: notice, _subscriptions: subscriptions }
     }
 
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -57,13 +57,13 @@ impl LoginView {
             return;
         }
         let server = self.server.read(cx).value().to_string();
-        let username = self.username.read(cx).value().trim().to_string();
+        let email = self.email.read(cx).value().trim().to_string();
         let password = self.password.read(cx).value().to_string();
         let invite = self.invite.read(cx).value().trim().to_string();
         let register = self.register;
 
-        let problem = if username.is_empty() {
-            Some("Bitte einen Benutzernamen eingeben.")
+        let problem = if email.is_empty() {
+            Some("Bitte eine E-Mail-Adresse eingeben.")
         } else if password.is_empty() {
             Some("Bitte ein Passwort eingeben.")
         } else if register && password.chars().count() < 10 {
@@ -82,7 +82,7 @@ impl LoginView {
         cx.notify();
 
         let task = cx.background_executor().spawn(async move {
-            let session = api::authenticate(&server, &username, &password, register, &invite)?;
+            let session = api::authenticate(&server, &email, &password, register, &invite)?;
             let kept = api::save(&session);
             Ok::<_, String>((session, kept))
         });
@@ -146,7 +146,7 @@ impl Render for LoginView {
                             .child(if register { "Neues Konto erstellen" } else { "Bei deinem Konto anmelden" }),
                     )
                     .child(field("Server", &self.server))
-                    .child(field("Benutzername", &self.username))
+                    .child(field("E-Mail-Adresse", &self.email))
                     .child(
                         div()
                             .flex()

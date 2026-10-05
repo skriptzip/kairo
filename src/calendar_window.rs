@@ -60,7 +60,7 @@ impl CalendarWindow {
             state.set_value(info.name.clone(), window, cx);
             state
         });
-        let invite_input = cx.new(|cx| InputState::new(window, cx).placeholder("Benutzername einladen"));
+        let invite_input = cx.new(|cx| InputState::new(window, cx).placeholder("E-Mail-Adresse einladen"));
         let role_select = cx.new(|cx| {
             let labels: Vec<String> = ROLES.iter().map(|(_, label)| label.to_string()).collect();
             SelectState::new(labels, Some(IndexPath::new(0)), window, cx)
@@ -158,13 +158,13 @@ impl CalendarWindow {
     }
 
     fn invite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let username = self.invite_input.read(cx).value().trim().to_string();
-        if username.is_empty() {
+        let email = self.invite_input.read(cx).value().trim().to_string();
+        if email.is_empty() {
             return;
         }
         let role = ROLES[self.role_index].0;
         self.invite_input.update(cx, |input, cx| input.set_value("", window, cx));
-        self.run(window, cx, move |session, id| members::invite(session, id, &username, role));
+        self.run(window, cx, move |session, id| members::invite(session, id, &email, role));
     }
 
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -208,7 +208,7 @@ impl CalendarWindow {
             .child(div().flex_1().child(list.owner.clone()))
             .child(div().text_sm().text_color(muted).child(role_label("owner")));
         let rows = list.members.iter().enumerate().map(|(i, member)| {
-            let (name, role) = (member.username.clone(), member.role.clone());
+            let (name, role) = (member.email.clone(), member.role.clone());
             let other = if role == "editor" { "viewer" } else { "editor" };
             let (toggle_name, remove_name) = (name.clone(), name.clone());
             let status = if member.accepted {

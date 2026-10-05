@@ -155,7 +155,7 @@ impl Event {
 impl Store {
     /// One cache file per account and server, so switching accounts never mixes data.
     fn path(session: &Session) -> Option<PathBuf> {
-        let key: String = format!("{}@{}", session.username, session.server)
+        let key: String = format!("{}@{}", session.email, session.server)
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
             .collect();

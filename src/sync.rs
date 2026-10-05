@@ -228,7 +228,7 @@ fn push_calendar_removal(
     removal: &PendingCalendarRemoval,
 ) -> Result<(), Failure> {
     let url = if removal.leave {
-        format!("{}/api/v1/calendars/{}/members/{}", session.server, removal.id, session.username)
+        format!("{}/api/v1/calendars/{}/members/{}", session.server, removal.id, session.email)
     } else {
         format!("{}/api/v1/calendars/{}", session.server, removal.id)
     };
@@ -641,7 +641,7 @@ mod tests {
         let mut draft = event("d", "unsaved", 0, true);
         draft.draft = true;
         let store = store_with(vec![draft, event("a", "saved", 0, true)]);
-        let job = store.job(&Session { server: String::new(), username: String::new(), token: String::new(), feed_token: String::new() });
+        let job = store.job(&Session { server: String::new(), email: String::new(), token: String::new(), feed_token: String::new() });
         assert_eq!(job.events.len(), 1);
         assert_eq!(job.events[0].id, "a");
 
