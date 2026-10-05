@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Kairo
+Comment=Kairo Kalender
+Exec=kairo
+Icon=kairo
+Terminal=false
+Categories=Office;Calendar;
+StartupWMClass=kairo
