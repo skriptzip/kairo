@@ -6,13 +6,14 @@
 
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{ActiveTheme, Disableable, IndexPath, Sizable};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
 use crate::{
-    CalendarApp, PALETTE,
+    CalendarApp, CloseWindow, PALETTE,
     api::Session,
     members::{self, MemberList, role_label},
     model::parse_color,
@@ -193,6 +194,7 @@ impl CalendarWindow {
 
     fn render_members(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
+        let this = cx.entity();
         if self.info.is_draft {
             let hint = "Speichere den Kalender zuerst, dann kannst du Leute einladen.";
             return div().text_sm().text_color(muted).child(hint).into_any_element();
@@ -216,7 +218,10 @@ impl CalendarWindow {
             } else {
                 format!("{} · Einladung offen", role_label(&role))
             };
-            div()
+            let (menu_this, menu_toggle, menu_remove) = (this.clone(), name.clone(), name.clone());
+            let busy = self.busy;
+            let row = div()
+                .id(("member", i))
                 .flex()
                 .items_center()
                 .gap_2()
@@ -243,7 +248,28 @@ impl CalendarWindow {
                                 this.run(window, cx, move |s, id| members::remove(s, id, &name));
                             })),
                     )
-                })
+                });
+            if !self.info.is_owner {
+                return row.into_any_element();
+            }
+            row.context_menu(move |menu, _, _| {
+                let (role_this, remove_this) = (menu_this.clone(), menu_this.clone());
+                let (role_name, remove_name) = (menu_toggle.clone(), menu_remove.clone());
+                let label = if other == "editor" { "Auf Bearbeiten setzen" } else { "Auf Ansehen setzen" };
+                menu.item(PopupMenuItem::new(label).disabled(busy).on_click(move |_, window, cx| {
+                    let name = role_name.clone();
+                    role_this.update(cx, |this, cx| {
+                        this.run(window, cx, move |s, id| members::invite(s, id, &name, other))
+                    })
+                }))
+                .item(PopupMenuItem::new("Entfernen").disabled(busy).on_click(move |_, window, cx| {
+                    let name = remove_name.clone();
+                    remove_this.update(cx, |this, cx| {
+                        this.run(window, cx, move |s, id| members::remove(s, id, &name))
+                    })
+                }))
+            })
+            .into_any_element()
         });
         div().flex().flex_col().gap_2().child(owner_row).children(rows).into_any_element()
     }
@@ -283,6 +309,8 @@ impl Render for CalendarWindow {
         };
 
         div()
+            .key_context("CalendarWindow")
+            .on_action(|_: &CloseWindow, window, _| window.remove_window())
             .flex()
             .flex_col()
             .size_full()
