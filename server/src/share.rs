@@ -20,9 +20,9 @@ use serde_json::json;
 
 use crate::{AppState, Error, User, next_rev};
 
-/// Ids of all calendars `?1` (a username) may see: owned or accepted membership.
+/// Ids of all calendars `?1` (an email address) may see: owned or accepted membership.
 pub const ACCESSIBLE: &str = "(SELECT id FROM calendars WHERE owner = ?1 \
-     UNION SELECT calendar_id FROM calendar_members WHERE username = ?1 AND accepted = 1)";
+     UNION SELECT calendar_id FROM calendar_members WHERE email = ?1 AND accepted = 1)";
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Access {
@@ -35,10 +35,10 @@ pub enum Access {
 pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS calendar_members (
-             calendar_id TEXT NOT NULL, username TEXT NOT NULL, role TEXT NOT NULL,
+             calendar_id TEXT NOT NULL, email TEXT NOT NULL, role TEXT NOT NULL,
              accepted INTEGER NOT NULL DEFAULT 0, invited_by TEXT NOT NULL,
-             PRIMARY KEY (calendar_id, username));
-         CREATE INDEX IF NOT EXISTS calendar_members_user ON calendar_members (username);",
+             PRIMARY KEY (calendar_id, email));
+         CREATE INDEX IF NOT EXISTS calendar_members_user ON calendar_members (email);",
     )
 }
 
@@ -55,7 +55,7 @@ pub fn access(conn: &Connection, user: &str, calendar_id: &str) -> rusqlite::Res
     }
     let role: Option<String> = conn
         .query_row(
-            "SELECT role FROM calendar_members WHERE calendar_id = ?1 AND username = ?2 AND accepted = 1",
+            "SELECT role FROM calendar_members WHERE calendar_id = ?1 AND email = ?2 AND accepted = 1",
             params![calendar_id, user],
             |r| r.get(0),
         )
@@ -70,7 +70,7 @@ pub fn access(conn: &Connection, user: &str, calendar_id: &str) -> rusqlite::Res
 /// Owner plus accepted members: everybody who should hear about a change.
 pub fn users_of(conn: &Connection, calendar_id: &str) -> rusqlite::Result<Vec<String>> {
     let mut users: Vec<String> = conn
-        .prepare("SELECT owner FROM calendars WHERE id = ?1 UNION SELECT username FROM calendar_members WHERE calendar_id = ?1 AND accepted = 1")?
+        .prepare("SELECT owner FROM calendars WHERE id = ?1 UNION SELECT email FROM calendar_members WHERE calendar_id = ?1 AND accepted = 1")?
         .query_map([calendar_id], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     users.sort();
@@ -117,11 +117,11 @@ pub async fn list_members(
     let (owner, _) = calendar_info(&db, &id)?.ok_or(Error::NotFound("calendar"))?;
     let members = db
         .prepare(
-            "SELECT username, role, accepted FROM calendar_members WHERE calendar_id = ?1
-             AND (accepted = 1 OR ?2) ORDER BY username",
+            "SELECT email, role, accepted FROM calendar_members WHERE calendar_id = ?1
+             AND (accepted = 1 OR ?2) ORDER BY email",
         )?
         .query_map(params![id, level == Access::Owner], |r| {
-            Ok(json!({ "username": r.get::<_, String>(0)?, "role": r.get::<_, String>(1)?, "accepted": r.get::<_, bool>(2)? }))
+            Ok(json!({ "email": r.get::<_, String>(0)?, "role": r.get::<_, String>(1)?, "accepted": r.get::<_, bool>(2)? }))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(Json(json!({ "owner": owner, "members": members })).into_response())
@@ -150,7 +150,7 @@ pub async fn invite(
     let tx = db.transaction()?;
     require_owner(&tx, &user, &id)?;
     let exists = tx
-        .query_row("SELECT 1 FROM users WHERE username = ?1", [&invitee], |_| Ok(()))
+        .query_row("SELECT 1 FROM users WHERE email = ?1", [&invitee], |_| Ok(()))
         .optional()?
         .is_some();
     if !exists {
@@ -158,7 +158,7 @@ pub async fn invite(
     }
     let was_accepted: bool = tx
         .query_row(
-            "SELECT accepted FROM calendar_members WHERE calendar_id = ?1 AND username = ?2",
+            "SELECT accepted FROM calendar_members WHERE calendar_id = ?1 AND email = ?2",
             params![id, invitee],
             |r| r.get(0),
         )
@@ -166,9 +166,9 @@ pub async fn invite(
         .unwrap_or(false);
     let rev = next_rev(&tx)?;
     tx.execute(
-        "INSERT INTO calendar_members (calendar_id, username, role, accepted, invited_by)
+        "INSERT INTO calendar_members (calendar_id, email, role, accepted, invited_by)
          VALUES (?1, ?2, ?3, 0, ?4)
-         ON CONFLICT(calendar_id, username) DO UPDATE SET role = excluded.role",
+         ON CONFLICT(calendar_id, email) DO UPDATE SET role = excluded.role",
         params![id, invitee, body.role, user],
     )?;
     if was_accepted {
@@ -179,7 +179,7 @@ pub async fn invite(
     audience.push(invitee.clone());
     tx.commit()?;
     state.notify_all(&audience, rev);
-    Ok(Json(json!({ "username": invitee, "role": body.role, "accepted": was_accepted })).into_response())
+    Ok(Json(json!({ "email": invitee, "role": body.role, "accepted": was_accepted })).into_response())
 }
 
 /// The invited user joins the calendar.
@@ -194,7 +194,7 @@ pub async fn accept(
         return Err(Error::NotFound("invitation"));
     }
     let n = tx.execute(
-        "UPDATE calendar_members SET accepted = 1 WHERE calendar_id = ?1 AND username = ?2 AND accepted = 0",
+        "UPDATE calendar_members SET accepted = 1 WHERE calendar_id = ?1 AND email = ?2 AND accepted = 0",
         params![id, user],
     )?;
     if n == 0 {
@@ -224,7 +224,7 @@ pub async fn remove_member(
     if user != owner && user != target {
         return Err(denied(access(&tx, &user, &id)?, "only the owner can remove other members"));
     }
-    let n = tx.execute("DELETE FROM calendar_members WHERE calendar_id = ?1 AND username = ?2", params![id, target])?;
+    let n = tx.execute("DELETE FROM calendar_members WHERE calendar_id = ?1 AND email = ?2", params![id, target])?;
     if n == 0 {
         return Err(Error::NotFound("member"));
     }

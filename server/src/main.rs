@@ -150,7 +150,7 @@ enum Error {
     Invalid(String),
     Unauthorized(&'static str),
     Forbidden(&'static str),
-    /// Username already registered.
+    /// Email already registered.
     Taken,
     /// Seconds until the client may retry.
     TooManyRequests(u64),
@@ -193,7 +193,7 @@ impl IntoResponse for Error {
                 (StatusCode::FORBIDDEN, Json(json!({ "error": msg }))).into_response()
             }
             Error::Taken => {
-                (StatusCode::CONFLICT, Json(json!({ "error": "username is already taken" })))
+                (StatusCode::CONFLICT, Json(json!({ "error": "email is already registered" })))
                     .into_response()
             }
             Error::TooManyRequests(secs) => (
@@ -242,6 +242,7 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     if !has_status {
         conn.execute("ALTER TABLE events ADD COLUMN status TEXT NOT NULL DEFAULT 'busy'", [])?;
     }
+    auth::migrate_username_to_email(conn)?;
     share::init_db(conn)?;
     auth::init_db(conn)
 }
@@ -348,8 +349,8 @@ async fn sync(
                     CASE WHEN c.owner = ?1 THEN 'owner' ELSE m.role END
              FROM calendars c
              LEFT JOIN calendar_members m
-               ON m.calendar_id = c.id AND m.username = ?1 AND m.accepted = 1
-             WHERE (c.owner = ?1 OR m.username IS NOT NULL) AND c.rev > ?2
+               ON m.calendar_id = c.id AND m.email = ?1 AND m.accepted = 1
+             WHERE (c.owner = ?1 OR m.email IS NOT NULL) AND c.rev > ?2
              ORDER BY c.rev",
         )?
         .query_map(params![user, query.since], calendar_from_row)?
@@ -373,7 +374,7 @@ async fn sync(
         .prepare(
             "SELECT m.calendar_id, c.name, c.owner, m.role, m.invited_by
              FROM calendar_members m JOIN calendars c ON c.id = m.calendar_id
-             WHERE m.username = ?1 AND m.accepted = 0 AND c.deleted = 0 ORDER BY c.name",
+             WHERE m.email = ?1 AND m.accepted = 0 AND c.deleted = 0 ORDER BY c.name",
         )?
         .query_map([&user], |r| {
             Ok(Invite {
@@ -684,7 +685,7 @@ fn router(state: AppState) -> Router {
         .route("/calendars/{id}", put(put_calendar).delete(delete_calendar))
         .route("/events/{id}", put(put_event).delete(delete_event))
         .route("/calendars/{id}/members", get(share::list_members))
-        .route("/calendars/{id}/members/{username}", put(share::invite).delete(share::remove_member))
+        .route("/calendars/{id}/members/{email}", put(share::invite).delete(share::remove_member))
         .route("/calendars/{id}/accept", post(share::accept))
         .route("/ws", get(live::ws))
         .merge(auth::protected_routes())
@@ -774,7 +775,7 @@ mod tests {
 
     /// Registers `name` and returns the session token.
     async fn register(app: &Router, name: &str) -> String {
-        let (s, body) = call(app, "POST", "/api/v1/auth/register", "", Some(json!({ "username": name, "password": PASSWORD }))).await;
+        let (s, body) = call(app, "POST", "/api/v1/auth/register", "", Some(json!({ "email": name, "password": PASSWORD }))).await;
         assert_eq!(s, StatusCode::CREATED, "{body}");
         body["token"].as_str().unwrap().to_string()
     }
@@ -795,22 +796,22 @@ mod tests {
     #[tokio::test]
     async fn register_login_logout() {
         let app = app();
-        let token = register(&app, "Alice").await; // usernames are case-insensitive
+        let token = register(&app, "Alice@Example.com").await; // emails are case-insensitive
         let (s, me) = call(&app, "GET", "/api/v1/auth/me", &token, None).await;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(me["username"], "alice");
+        assert_eq!(me["email"], "alice@example.com");
 
-        // duplicate (any casing), weak password and bad username are rejected
-        let dup = |name: &str, pw: &str| json!({ "username": name, "password": pw });
-        let (s, _) = call(&app, "POST", "/api/v1/auth/register", "", Some(dup("alice", PASSWORD))).await;
+        // duplicate (any casing), weak password and bad email are rejected
+        let dup = |name: &str, pw: &str| json!({ "email": name, "password": pw });
+        let (s, _) = call(&app, "POST", "/api/v1/auth/register", "", Some(dup("alice@example.com", PASSWORD))).await;
         assert_eq!(s, StatusCode::CONFLICT);
-        let (s, _) = call(&app, "POST", "/api/v1/auth/register", "", Some(dup("bob", "short"))).await;
+        let (s, _) = call(&app, "POST", "/api/v1/auth/register", "", Some(dup("bob@example.com", "short"))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
-        let (s, _) = call(&app, "POST", "/api/v1/auth/register", "", Some(dup("b o b!", PASSWORD))).await;
+        let (s, _) = call(&app, "POST", "/api/v1/auth/register", "", Some(dup("b o b@example", PASSWORD))).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
 
         // login gives an independent second session
-        let (s, login) = call(&app, "POST", "/api/v1/auth/login", "", Some(json!({ "username": "alice", "password": PASSWORD, "device": "phone" }))).await;
+        let (s, login) = call(&app, "POST", "/api/v1/auth/login", "", Some(json!({ "email": "alice@example.com", "password": PASSWORD, "device": "phone" }))).await;
         assert_eq!(s, StatusCode::OK);
         let phone = login["token"].as_str().unwrap().to_string();
         assert_ne!(phone, token);
@@ -824,9 +825,9 @@ mod tests {
         assert_eq!(call(&app, "GET", "/api/v1/auth/me", &token, None).await.0, StatusCode::OK);
 
         // wrong password / unknown user look the same
-        let bad = |u: &str| json!({ "username": u, "password": "nope-nope-nope" });
-        let (s1, b1) = call(&app, "POST", "/api/v1/auth/login", "", Some(bad("alice"))).await;
-        let (s2, b2) = call(&app, "POST", "/api/v1/auth/login", "", Some(bad("ghost"))).await;
+        let bad = |u: &str| json!({ "email": u, "password": "nope-nope-nope" });
+        let (s1, b1) = call(&app, "POST", "/api/v1/auth/login", "", Some(bad("alice@example.com"))).await;
+        let (s2, b2) = call(&app, "POST", "/api/v1/auth/login", "", Some(bad("ghost@example.com"))).await;
         assert_eq!((s1, s2), (StatusCode::UNAUTHORIZED, StatusCode::UNAUTHORIZED));
         assert_eq!(b1, b2);
     }
@@ -834,14 +835,14 @@ mod tests {
     #[tokio::test]
     async fn failed_logins_lock_out() {
         let app = app();
-        register(&app, "alice").await;
-        let bad = json!({ "username": "alice", "password": "wrong-wrong-wrong" });
+        register(&app, "alice@example.com").await;
+        let bad = json!({ "email": "alice@example.com", "password": "wrong-wrong-wrong" });
         for _ in 0..8 {
             let (s, _) = call(&app, "POST", "/api/v1/auth/login", "", Some(bad.clone())).await;
             assert_eq!(s, StatusCode::UNAUTHORIZED);
         }
         // locked, even with the correct password
-        let good = json!({ "username": "alice", "password": PASSWORD });
+        let good = json!({ "email": "alice@example.com", "password": PASSWORD });
         let (s, _) = call(&app, "POST", "/api/v1/auth/login", "", Some(good)).await;
         assert_eq!(s, StatusCode::TOO_MANY_REQUESTS);
     }
@@ -849,14 +850,14 @@ mod tests {
     #[tokio::test]
     async fn registration_can_be_closed_or_need_invite() {
         let closed = app_with(auth::Config::test(false, None));
-        let body = json!({ "username": "alice", "password": PASSWORD });
+        let body = json!({ "email": "alice@example.com", "password": PASSWORD });
         let (s, _) = call(&closed, "POST", "/api/v1/auth/register", "", Some(body.clone())).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
 
         let invite = app_with(auth::Config::test(true, Some("sesame")));
         let (s, _) = call(&invite, "POST", "/api/v1/auth/register", "", Some(body.clone())).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
-        let with_code = json!({ "username": "alice", "password": PASSWORD, "invite_code": "sesame" });
+        let with_code = json!({ "email": "alice@example.com", "password": PASSWORD, "invite_code": "sesame" });
         let (s, _) = call(&invite, "POST", "/api/v1/auth/register", "", Some(with_code)).await;
         assert_eq!(s, StatusCode::CREATED);
     }
@@ -864,8 +865,8 @@ mod tests {
     #[tokio::test]
     async fn password_change_revokes_other_sessions() {
         let app = app();
-        let laptop = register(&app, "alice").await;
-        let (_, login) = call(&app, "POST", "/api/v1/auth/login", "", Some(json!({ "username": "alice", "password": PASSWORD }))).await;
+        let laptop = register(&app, "alice@example.com").await;
+        let (_, login) = call(&app, "POST", "/api/v1/auth/login", "", Some(json!({ "email": "alice@example.com", "password": PASSWORD }))).await;
         let phone = login["token"].as_str().unwrap().to_string();
 
         let change = |current: &str| json!({ "current_password": current, "new_password": "a brand new passphrase" });
@@ -876,16 +877,16 @@ mod tests {
 
         assert_eq!(call(&app, "GET", "/api/v1/auth/me", &laptop, None).await.0, StatusCode::OK);
         assert_eq!(call(&app, "GET", "/api/v1/auth/me", &phone, None).await.0, StatusCode::UNAUTHORIZED);
-        let old = json!({ "username": "alice", "password": PASSWORD });
+        let old = json!({ "email": "alice@example.com", "password": PASSWORD });
         assert_eq!(call(&app, "POST", "/api/v1/auth/login", "", Some(old)).await.0, StatusCode::UNAUTHORIZED);
-        let new = json!({ "username": "alice", "password": "a brand new passphrase" });
+        let new = json!({ "email": "alice@example.com", "password": "a brand new passphrase" });
         assert_eq!(call(&app, "POST", "/api/v1/auth/login", "", Some(new)).await.0, StatusCode::OK);
     }
 
     #[tokio::test]
     async fn feed_token_and_account_deletion() {
         let app = app();
-        let token = register(&app, "alice").await;
+        let token = register(&app, "alice@example.com").await;
         call(&app, "PUT", "/api/v1/calendars/c1", &token, Some(json!({ "name": "Team" }))).await;
         let (_, me) = call(&app, "GET", "/api/v1/auth/me", &token, None).await;
         let feed = me["feed_token"].as_str().unwrap().to_string();
@@ -913,14 +914,14 @@ mod tests {
         let (s, _) = call(&app, "DELETE", "/api/v1/auth/account", &token, Some(json!({ "password": PASSWORD }))).await;
         assert_eq!(s, StatusCode::NO_CONTENT);
         assert_eq!(call(&app, "GET", "/api/v1/sync", &token, None).await.0, StatusCode::UNAUTHORIZED);
-        let login = json!({ "username": "alice", "password": PASSWORD });
+        let login = json!({ "email": "alice@example.com", "password": PASSWORD });
         assert_eq!(call(&app, "POST", "/api/v1/auth/login", "", Some(login)).await.0, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn event_lifecycle_with_conflicts_and_delta_sync() {
         let app = app();
-        let alice = &register(&app, "alice").await;
+        let alice = &register(&app, "alice@example.com").await;
         let (s, _) = call(&app, "PUT", "/api/v1/calendars/c1", alice, Some(json!({ "name": "Team" }))).await;
         assert_eq!(s, StatusCode::OK);
 
@@ -975,10 +976,26 @@ mod tests {
         assert_eq!(status, "busy");
     }
 
+    #[test]
+    fn old_database_gets_email_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, feed_token TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
+             CREATE TABLE sessions (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, username TEXT NOT NULL, device TEXT NOT NULL, created_at INTEGER NOT NULL, last_used INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+             CREATE INDEX sessions_username ON sessions (username);
+             INSERT INTO users VALUES ('alice','h','f',1);",
+        )
+        .unwrap();
+        init_db(&conn).unwrap();
+        init_db(&conn).unwrap();
+        let who: String = conn.query_row("SELECT email FROM users", [], |r| r.get(0)).unwrap();
+        assert_eq!(who, "alice");
+    }
+
     #[tokio::test]
     async fn event_status_is_stored_and_validated() {
         let app = app();
-        let token = &register(&app, "alice").await;
+        let token = &register(&app, "alice@example.com").await;
         call(&app, "PUT", "/api/v1/calendars/c1", token, Some(json!({ "name": "Team" }))).await;
 
         // defaults to busy
@@ -1001,9 +1018,9 @@ mod tests {
     #[tokio::test]
     async fn sharing_invites_roles_and_leaving() {
         let app = app();
-        let alice = &register(&app, "alice").await;
-        let bob = &register(&app, "bob").await;
-        let carol = &register(&app, "carol").await;
+        let alice = &register(&app, "alice@example.com").await;
+        let bob = &register(&app, "bob@example.com").await;
+        let carol = &register(&app, "carol@example.com").await;
         let cal = |t: &str, m: &str, u: &str, b: Option<serde_json::Value>| {
             let (app, t, m, u) = (app.clone(), t.to_string(), m.to_string(), u.to_string());
             async move { call(&app, &m, &u, &t, b).await }
@@ -1014,18 +1031,18 @@ mod tests {
 
         // inviting: unknown user, bad role and non-owners are refused
         let invite = |role: &str| Some(json!({ "role": role }));
-        assert_eq!(cal(alice, "PUT", "/api/v1/calendars/c1/members/nobody", invite("editor")).await.0, StatusCode::NOT_FOUND);
-        assert_eq!(cal(alice, "PUT", "/api/v1/calendars/c1/members/bob", invite("admin")).await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(cal(bob, "PUT", "/api/v1/calendars/c1/members/carol", invite("viewer")).await.0, StatusCode::NOT_FOUND);
-        assert_eq!(cal(alice, "PUT", "/api/v1/calendars/c1/members/alice", invite("editor")).await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(cal(alice, "PUT", "/api/v1/calendars/c1/members/bob", invite("editor")).await.0, StatusCode::OK);
-        assert_eq!(cal(alice, "PUT", "/api/v1/calendars/c1/members/carol", invite("viewer")).await.0, StatusCode::OK);
+        assert_eq!(cal(alice, "PUT", "/api/v1/calendars/c1/members/nobody@example.com", invite("editor")).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(cal(alice, "PUT", "/api/v1/calendars/c1/members/bob@example.com", invite("admin")).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(cal(bob, "PUT", "/api/v1/calendars/c1/members/carol@example.com", invite("viewer")).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(cal(alice, "PUT", "/api/v1/calendars/c1/members/alice@example.com", invite("editor")).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(cal(alice, "PUT", "/api/v1/calendars/c1/members/bob@example.com", invite("editor")).await.0, StatusCode::OK);
+        assert_eq!(cal(alice, "PUT", "/api/v1/calendars/c1/members/carol@example.com", invite("viewer")).await.0, StatusCode::OK);
 
         // pending: Bob sees the invitation but neither the calendar nor its events
         let (_, sync) = cal(bob, "GET", "/api/v1/sync", None).await;
         assert!(sync["calendars"].as_array().unwrap().is_empty() && sync["events"].as_array().unwrap().is_empty());
         assert_eq!(sync["invites"][0]["calendar_id"], "c1");
-        assert_eq!(sync["invites"][0]["owner"], "alice");
+        assert_eq!(sync["invites"][0]["owner"], "alice@example.com");
         assert_eq!(cal(bob, "PUT", "/api/v1/events/e2", Some(event("Early"))).await.0, StatusCode::NOT_FOUND);
 
         // only the invitee can accept
@@ -1036,7 +1053,7 @@ mod tests {
         // a member who synced a long time ago (since far in the past) still gets everything
         let (_, sync) = cal(bob, "GET", "/api/v1/sync?since=0", None).await;
         assert_eq!(sync["calendars"][0]["role"], "editor");
-        assert_eq!(sync["calendars"][0]["owner"], "alice");
+        assert_eq!(sync["calendars"][0]["owner"], "alice@example.com");
         assert_eq!(sync["events"].as_array().unwrap().len(), 1);
         assert!(sync["invites"].as_array().unwrap().is_empty());
         let head = sync["rev"].as_i64().unwrap();
@@ -1060,18 +1077,18 @@ mod tests {
         // members list: owner sees everybody, members only accepted ones
         let (_, members) = cal(alice, "GET", "/api/v1/calendars/c1/members", None).await;
         assert_eq!(members["members"].as_array().unwrap().len(), 2);
-        assert_eq!(cal(&register(&app, "dave").await, "GET", "/api/v1/calendars/c1/members", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(cal(&register(&app, "dave@example.com").await, "GET", "/api/v1/calendars/c1/members", None).await.0, StatusCode::NOT_FOUND);
 
         // owner removes Carol: her calendar list no longer contains it
-        assert_eq!(cal(bob, "DELETE", "/api/v1/calendars/c1/members/carol", None).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(cal(alice, "DELETE", "/api/v1/calendars/c1/members/carol", None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(cal(bob, "DELETE", "/api/v1/calendars/c1/members/carol@example.com", None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(cal(alice, "DELETE", "/api/v1/calendars/c1/members/carol@example.com", None).await.0, StatusCode::NO_CONTENT);
         let (_, c) = cal(carol, "GET", "/api/v1/sync", None).await;
         assert!(c["calendar_ids"].as_array().unwrap().is_empty());
         assert_eq!(cal(carol, "PUT", "/api/v1/events/e6", Some(event("Nope"))).await.0, StatusCode::NOT_FOUND);
 
         // Bob leaves on his own; the owner can't leave
-        assert_eq!(cal(alice, "DELETE", "/api/v1/calendars/c1/members/alice", None).await.0, StatusCode::BAD_REQUEST);
-        assert_eq!(cal(bob, "DELETE", "/api/v1/calendars/c1/members/bob", None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(cal(alice, "DELETE", "/api/v1/calendars/c1/members/alice@example.com", None).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(cal(bob, "DELETE", "/api/v1/calendars/c1/members/bob@example.com", None).await.0, StatusCode::NO_CONTENT);
         let (_, b) = cal(bob, "GET", "/api/v1/sync", None).await;
         assert!(b["calendar_ids"].as_array().unwrap().is_empty());
     }
@@ -1079,20 +1096,20 @@ mod tests {
     #[tokio::test]
     async fn deleting_a_shared_calendar_reaches_members() {
         let app = app();
-        let alice = &register(&app, "alice").await;
-        let bob = &register(&app, "bob").await;
+        let alice = &register(&app, "alice@example.com").await;
+        let bob = &register(&app, "bob@example.com").await;
         call(&app, "PUT", "/api/v1/calendars/c1", alice, Some(json!({ "name": "Team" }))).await;
         call(&app, "PUT", "/api/v1/events/e1", alice, Some(event("x"))).await;
-        call(&app, "PUT", "/api/v1/calendars/c1/members/bob", alice, Some(json!({ "role": "editor" }))).await;
+        call(&app, "PUT", "/api/v1/calendars/c1/members/bob@example.com", alice, Some(json!({ "role": "editor" }))).await;
         call(&app, "POST", "/api/v1/calendars/c1/accept", bob, None).await;
         let (_, first) = call(&app, "GET", "/api/v1/sync", bob, None).await;
         let head = first["rev"].as_i64().unwrap();
 
         // declining an invitation removes it
         call(&app, "PUT", "/api/v1/calendars/c2", alice, Some(json!({ "name": "Other" }))).await;
-        call(&app, "PUT", "/api/v1/calendars/c2/members/bob", alice, Some(json!({ "role": "viewer" }))).await;
+        call(&app, "PUT", "/api/v1/calendars/c2/members/bob@example.com", alice, Some(json!({ "role": "viewer" }))).await;
         assert_eq!(call(&app, "GET", "/api/v1/sync", bob, None).await.1["invites"].as_array().unwrap().len(), 1);
-        call(&app, "DELETE", "/api/v1/calendars/c2/members/bob", bob, None).await;
+        call(&app, "DELETE", "/api/v1/calendars/c2/members/bob@example.com", bob, None).await;
         assert!(call(&app, "GET", "/api/v1/sync", bob, None).await.1["invites"].as_array().unwrap().is_empty());
 
         // the owner deletes the calendar; Bob gets the tombstone through his delta sync
@@ -1105,8 +1122,8 @@ mod tests {
     #[tokio::test]
     async fn users_are_isolated() {
         let app = app();
-        let alice = &register(&app, "alice").await;
-        let bob = &register(&app, "bob").await;
+        let alice = &register(&app, "alice@example.com").await;
+        let bob = &register(&app, "bob@example.com").await;
         call(&app, "PUT", "/api/v1/calendars/c1", alice, Some(json!({ "name": "Team" }))).await;
         call(&app, "PUT", "/api/v1/events/e1", alice, Some(event("Secret"))).await;
 
