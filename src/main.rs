@@ -17,11 +17,57 @@ use gpui_kit::component::date_picker::{DatePicker, DatePickerEvent, DatePickerSt
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::{Disableable, IndexPath, Sizable};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use calendar_window::{CalendarSnapshot, CalendarWindow};
 use login::{LoginEvent, LoginView};
 use model::{CalendarInfo, Event, Store, new_id, parse_color};
+
+actions!(
+    kairo,
+    [
+        NewEvent,
+        OpenEvent,
+        DeleteEvent,
+        DuplicateEvent,
+        ClearSelection,
+        GoToday,
+        PrevPeriod,
+        NextPeriod,
+        ViewDay,
+        ViewWorkWeek,
+        ViewWeek,
+        SyncNow,
+        SaveEvent,
+        CloseWindow,
+    ]
+);
+
+/// Registers the keyboard shortcuts; the context names match `key_context` in the views.
+fn bind_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-n", NewEvent, Some("CalendarApp")),
+        KeyBinding::new("enter", OpenEvent, Some("CalendarApp")),
+        KeyBinding::new("f2", OpenEvent, Some("CalendarApp")),
+        KeyBinding::new("delete", DeleteEvent, Some("CalendarApp")),
+        KeyBinding::new("backspace", DeleteEvent, Some("CalendarApp")),
+        KeyBinding::new("ctrl-d", DuplicateEvent, Some("CalendarApp")),
+        KeyBinding::new("escape", ClearSelection, Some("CalendarApp")),
+        KeyBinding::new("ctrl-t", GoToday, Some("CalendarApp")),
+        KeyBinding::new("ctrl-left", PrevPeriod, Some("CalendarApp")),
+        KeyBinding::new("ctrl-right", NextPeriod, Some("CalendarApp")),
+        KeyBinding::new("ctrl-1", ViewDay, Some("CalendarApp")),
+        KeyBinding::new("ctrl-2", ViewWorkWeek, Some("CalendarApp")),
+        KeyBinding::new("ctrl-3", ViewWeek, Some("CalendarApp")),
+        KeyBinding::new("f5", SyncNow, Some("CalendarApp")),
+        KeyBinding::new("ctrl-r", SyncNow, Some("CalendarApp")),
+        KeyBinding::new("ctrl-s", SaveEvent, Some("EventWindow")),
+        KeyBinding::new("ctrl-enter", SaveEvent, Some("EventWindow")),
+        KeyBinding::new("escape", CloseWindow, Some("EventWindow")),
+        KeyBinding::new("escape", CloseWindow, Some("CalendarWindow")),
+    ]);
+}
 
 /// Colors offered for calendars.
 const PALETTE: [&str; 8] =
@@ -76,6 +122,7 @@ struct CalendarApp {
     store: Store,
     mini_calendar: Entity<CalendarState>,
     scroll: ScrollHandle,
+    focus: FocusHandle,
     details_window: Option<AnyWindowHandle>,
     calendar_window: Option<AnyWindowHandle>,
     /// Last problem answering an invitation, shown under the invitations.
@@ -159,6 +206,7 @@ impl CalendarApp {
             store,
             mini_calendar,
             scroll,
+            focus: cx.focus_handle(),
             details_window: None,
             calendar_window: None,
             notice: None,
@@ -177,6 +225,7 @@ impl CalendarApp {
             _subscriptions: subscriptions,
         };
         app.sync_now(cx);
+        window.focus(&app.focus, cx);
         app
     }
 
@@ -461,6 +510,39 @@ impl CalendarApp {
         self.mark_changed(cx);
     }
 
+    /// Copies an event right after itself in the same calendar.
+    fn duplicate_event(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(original) = self.store.events.iter().find(|e| e.id == id && !e.draft) else { return };
+        if !self.calendar(&original.calendar).is_some_and(|c| c.can_edit()) {
+            return;
+        }
+        let copy = Event { id: new_id(), rev: 0, dirty: true, draft: false, ..original.clone() };
+        let copy_id = copy.id.clone();
+        self.store.events.push(copy);
+        self.select_event(Some(copy_id), cx);
+        self.mark_changed(cx);
+    }
+
+    fn can_edit_event(&self, id: &str) -> bool {
+        self.store
+            .events
+            .iter()
+            .find(|e| e.id == id)
+            .is_some_and(|e| self.calendar(&e.calendar).is_some_and(|c| c.can_edit()))
+    }
+
+    /// "Neuer Termin" at the given slot, opened for editing.
+    fn create_and_open(&mut self, day: NaiveDate, hour: u32, cx: &mut Context<Self>) {
+        self.create_event(day, hour, cx);
+        self.open_details(cx);
+    }
+
+    fn new_event_now(&mut self, cx: &mut Context<Self>) {
+        let now = chrono::Local::now().naive_local();
+        let hour = if self.date == now.date() { (now.hour() + 1).clamp(8, 22) } else { 9 };
+        self.create_and_open(self.date, hour, cx);
+    }
+
     fn go_to(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
         self.date = date;
         self.mini_calendar
@@ -562,16 +644,7 @@ impl CalendarApp {
                 Button::new("new-event")
                     .primary()
                     .label("Neuer Termin")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        let now = chrono::Local::now().naive_local();
-                        let hour = if this.date == now.date() {
-                            (now.hour() + 1).clamp(8, 22)
-                        } else {
-                            9
-                        };
-                        this.create_event(this.date, hour, cx);
-                        this.open_details(cx);
-                    })),
+                    .on_click(cx.listener(|this, _, _, cx| this.new_event_now(cx))),
             )
             .child(Button::new("today").label("Heute").on_click(cx.listener(
                 |this, _, window, cx| this.go_to(chrono::Local::now().date_naive(), window, cx),
@@ -604,10 +677,13 @@ impl CalendarApp {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
+        let app = cx.entity();
         let calendars = self.store.calendars.iter().enumerate().filter(|(_, c)| !c.draft).map(|(i, info)| {
             let color = rgb(parse_color(&info.color));
             let shared = (!info.is_owner()).then(|| format!("von {}", info.owner));
+            let (menu_app, menu_id, visible) = (app.clone(), info.id.clone(), info.visible);
             div()
+                .id(("calendar-row", i))
                 .flex()
                 .items_center()
                 .child(
@@ -648,11 +724,39 @@ impl CalendarApp {
                             this.open_calendar_window(&id, cx);
                         })),
                 )
+                .context_menu(move |menu, _, _| {
+                    let (toggle_app, edit_app, only_app) = (menu_app.clone(), menu_app.clone(), menu_app.clone());
+                    let (toggle_id, edit_id, only_id) = (menu_id.clone(), menu_id.clone(), menu_id.clone());
+                    menu.item(PopupMenuItem::new(if visible { "Ausblenden" } else { "Einblenden" }).on_click(
+                        move |_, _, cx| {
+                            toggle_app.update(cx, |app, cx| {
+                                if let Some(c) = app.store.calendars.iter_mut().find(|c| c.id == toggle_id) {
+                                    c.visible = !c.visible;
+                                }
+                                cx.notify();
+                            })
+                        },
+                    ))
+                    .item(PopupMenuItem::new("Nur diesen anzeigen").on_click(move |_, _, cx| {
+                        only_app.update(cx, |app, cx| {
+                            for c in app.store.calendars.iter_mut() {
+                                c.visible = c.id == only_id;
+                            }
+                            cx.notify();
+                        })
+                    }))
+                    .separator()
+                    .item(PopupMenuItem::new("Einstellungen …").on_click(move |_, _, cx| {
+                        edit_app.update(cx, |app, cx| app.open_calendar_window(&edit_id, cx))
+                    }))
+                })
         });
 
         let invites = self.store.invites.iter().enumerate().map(|(i, invite)| {
             let (accept_id, decline_id) = (invite.calendar_id.clone(), invite.calendar_id.clone());
+            let (menu_app, menu_id) = (app.clone(), invite.calendar_id.clone());
             div()
+                .id(("invite", i))
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -677,6 +781,16 @@ impl CalendarApp {
                             cx.listener(move |this, _, _, cx| this.respond_to_invite(&decline_id, false, cx)),
                         )),
                 )
+                .context_menu(move |menu, _, _| {
+                    let (accept_app, decline_app) = (menu_app.clone(), menu_app.clone());
+                    let (accept_id, decline_id) = (menu_id.clone(), menu_id.clone());
+                    menu.item(PopupMenuItem::new("Annehmen").on_click(move |_, _, cx| {
+                        accept_app.update(cx, |app, cx| app.respond_to_invite(&accept_id, true, cx))
+                    }))
+                    .item(PopupMenuItem::new("Ablehnen").on_click(move |_, _, cx| {
+                        decline_app.update(cx, |app, cx| app.respond_to_invite(&decline_id, false, cx))
+                    }))
+                })
         });
         let has_invites = !self.store.invites.is_empty();
 
@@ -734,8 +848,11 @@ impl CalendarApp {
             .collect();
         let placed = Self::layout_day(&day_events);
 
+        let app = cx.entity();
+        let can_create = self.store.calendars.iter().any(|c| c.can_edit() && !c.draft);
         let slots = (0..24u32).map(|hour| {
             let marked = self.selected_slot == Some((day, hour));
+            let app = app.clone();
             div()
                 .id(("slot", day.num_days_from_ce() as usize * 24 + hour as usize))
                 .h(px(HOUR_H))
@@ -746,14 +863,34 @@ impl CalendarApp {
                 .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                     if ev.click_count() >= 2 {
                         // Double click: create the event and open its settings right away.
-                        this.create_event(day, hour, cx);
-                        this.open_details(cx);
+                        this.create_and_open(day, hour, cx);
                     } else {
                         this.selected = None;
                         this.selected_slot = Some((day, hour));
                         cx.notify();
                     }
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _, _, cx| {
+                        this.selected = None;
+                        this.selected_slot = Some((day, hour));
+                        cx.notify();
+                    }),
+                )
+                .context_menu(move |menu, _, _| {
+                    let (create_app, today_app) = (app.clone(), app.clone());
+                    menu.item(
+                        PopupMenuItem::new(format!("Neuer Termin um {hour:02}:00"))
+                            .disabled(!can_create)
+                            .on_click(move |_, _, cx| {
+                                create_app.update(cx, |app, cx| app.create_and_open(day, hour, cx))
+                            }),
+                    )
+                    .item(PopupMenuItem::new("Heute anzeigen  (Strg+T)").on_click(move |_, window, cx| {
+                        today_app.update(cx, |app, cx| app.go_to(chrono::Local::now().date_naive(), window, cx))
+                    }))
+                })
         });
 
         let blocks = placed.into_iter().map(|(i, col, cols)| {
@@ -764,6 +901,8 @@ impl CalendarApp {
             let color = rgb(self.calendar_color(&ev.calendar));
             let id = ev.id.clone();
             let selected = self.selected.as_ref() == Some(&id);
+            let editable = self.can_edit_event(&id);
+            let (menu_app, menu_id, select_id) = (app.clone(), id.clone(), id.clone());
 
             // Outlook-style "Anzeigen als": free is faint, tentative dashed, out of office purple.
             let status = ev.status.as_str();
@@ -808,6 +947,27 @@ impl CalendarApp {
                         this.open_details(cx);
                     }
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _, _, cx| this.select_event(Some(select_id.clone()), cx)),
+                )
+                .context_menu(move |menu, _, _| {
+                    let (open_app, copy_app, delete_app) = (menu_app.clone(), menu_app.clone(), menu_app.clone());
+                    let (open_id, copy_id, delete_id) = (menu_id.clone(), menu_id.clone(), menu_id.clone());
+                    menu.item(PopupMenuItem::new("Öffnen  (Enter)").on_click(move |_, _, cx| {
+                        open_app.update(cx, |app, cx| {
+                            app.select_event(Some(open_id.clone()), cx);
+                            app.open_details(cx);
+                        })
+                    }))
+                    .item(PopupMenuItem::new("Duplizieren  (Strg+D)").disabled(!editable).on_click(
+                        move |_, _, cx| copy_app.update(cx, |app, cx| app.duplicate_event(&copy_id, cx)),
+                    ))
+                    .separator()
+                    .item(PopupMenuItem::new("Löschen  (Entf)").disabled(!editable).on_click(
+                        move |_, _, cx| delete_app.update(cx, |app, cx| app.delete_event(&delete_id, cx)),
+                    ))
+                })
         });
 
         let now_line = (today.date() == day).then(|| {
@@ -1096,6 +1256,9 @@ impl EventWindow {
         });
         let mut subscriptions = subscriptions;
         subscriptions.push(release);
+        // So the shortcuts (Strg+S, Esc) work right away.
+        let title_focus = title_input.read(cx).focus_handle(cx);
+        window.focus(&title_focus, cx);
 
         Self {
             app,
@@ -1184,6 +1347,13 @@ impl Render for EventWindow {
         let color = self.calendars.get(self.calendar_index).map_or(0x808080, |c| c.color);
 
         div()
+            .key_context("EventWindow")
+            .on_action(cx.listener(|this, _: &SaveEvent, window, cx| {
+                if !this.read_only {
+                    this.save(window, cx);
+                }
+            }))
+            .on_action(|_: &CloseWindow, window, _| window.remove_window())
             .flex()
             .flex_col()
             .size_full()
@@ -1251,6 +1421,43 @@ impl Render for EventWindow {
 impl Render for CalendarApp {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .key_context("CalendarApp")
+            .track_focus(&self.focus)
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)))
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, _, window, cx| window.focus(&this.focus, cx)))
+            .on_action(cx.listener(|this, _: &NewEvent, _, cx| this.new_event_now(cx)))
+            .on_action(cx.listener(|this, _: &OpenEvent, _, cx| this.open_details(cx)))
+            .on_action(cx.listener(|this, _: &DeleteEvent, _, cx| {
+                if let Some(id) = this.selected.clone() {
+                    if this.can_edit_event(&id) {
+                        this.delete_event(&id, cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DuplicateEvent, _, cx| {
+                if let Some(id) = this.selected.clone() {
+                    this.duplicate_event(&id, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ClearSelection, _, cx| this.select_event(None, cx)))
+            .on_action(cx.listener(|this, _: &GoToday, window, cx| {
+                this.go_to(chrono::Local::now().date_naive(), window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PrevPeriod, window, cx| this.step(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &NextPeriod, window, cx| this.step(1, window, cx)))
+            .on_action(cx.listener(|this, _: &ViewDay, _, cx| {
+                this.mode = ViewMode::Day;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ViewWorkWeek, _, cx| {
+                this.mode = ViewMode::WorkWeek;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ViewWeek, _, cx| {
+                this.mode = ViewMode::Week;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SyncNow, _, cx| this.sync_now(cx)))
             .flex()
             .flex_col()
             .size_full()
@@ -1363,6 +1570,7 @@ fn main() {
         .with_assets(assets::Assets)
         .run(|cx| {
             init(cx);
+            bind_keys(cx);
             cx.set_app_identity("de.kairo.app", "Kairo");
 
             let options = WindowOptions {
