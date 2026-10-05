@@ -1,0 +1,20 @@
+services:
+  kairo-server:
+    build: ./server
+    restart: unless-stopped
+    ports:
+      # Only reachable from this machine; put a TLS reverse proxy in front for remote use
+      # and set KAIRO_TRUST_PROXY=1 below.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - kairo-data:/data
+    environment:
+      # open | closed (close it once everyone has registered)
+      KAIRO_REGISTRATION: ${KAIRO_REGISTRATION:-open}
+      # Optional: require this code to register
+      KAIRO_INVITE_CODE: ${KAIRO_INVITE_CODE:-}
+      # Set to 1 only behind a reverse proxy that sets X-Forwarded-For
+      KAIRO_TRUST_PROXY: ${KAIRO_TRUST_PROXY:-0}
+
+volumes:
+  kairo-data:
