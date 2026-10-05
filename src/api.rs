@@ -13,7 +13,7 @@ const KEYRING_SERVICE: &str = "kairo";
 #[derive(Clone, Debug)]
 pub struct Session {
     pub server: String,
-    pub username: String,
+    pub email: String,
     pub token: String,
     /// Read-only token for the `.ics` feed URL.
     pub feed_token: String,
@@ -22,7 +22,7 @@ pub struct Session {
 #[derive(Deserialize)]
 struct AuthResponse {
     token: String,
-    username: String,
+    email: String,
     feed_token: String,
 }
 
@@ -69,9 +69,9 @@ pub fn normalize_server(raw: &str) -> Result<String, String> {
 
 fn error_message(status: u16, body: Option<ErrorBody>) -> String {
     match status {
-        401 => "Benutzername oder Passwort ist falsch.".into(),
+        401 => "E-Mail-Adresse oder Passwort ist falsch.".into(),
         403 => "Registrierung nicht möglich (geschlossen oder Einladungscode falsch).".into(),
-        409 => "Dieser Benutzername ist bereits vergeben.".into(),
+        409 => "Diese E-Mail-Adresse ist bereits registriert.".into(),
         429 => {
             let minutes = body.and_then(|b| b.retry_after).map_or(15, |s| s.div_ceil(60).max(1));
             format!("Zu viele Versuche. Bitte in etwa {minutes} Min. erneut versuchen.")
@@ -94,14 +94,14 @@ pub fn device_name() -> String {
 
 pub fn authenticate(
     server: &str,
-    username: &str,
+    email: &str,
     password: &str,
     register: bool,
     invite_code: &str,
 ) -> Result<Session, String> {
     let server = normalize_server(server)?;
     let endpoint = if register { "register" } else { "login" };
-    let mut body = json!({ "username": username, "password": password, "device": device_name() });
+    let mut body = json!({ "email": email, "password": password, "device": device_name() });
     if register && !invite_code.is_empty() {
         body["invite_code"] = invite_code.into();
     }
@@ -114,7 +114,7 @@ pub fn authenticate(
         return Err(error_message(status, res.body_mut().read_json().ok()));
     }
     let auth: AuthResponse = res.body_mut().read_json().map_err(|_| "Unerwartete Antwort des Servers.".to_string())?;
-    Ok(Session { server, username: auth.username, token: auth.token, feed_token: auth.feed_token })
+    Ok(Session { server, email: auth.email, token: auth.token, feed_token: auth.feed_token })
 }
 
 pub fn validate(session: &Session) -> Validity {
@@ -138,13 +138,14 @@ pub fn logout(session: &Session) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Persistence: server/username in a config file, the token in the OS keychain
+// Persistence: server/email in a config file, the token in the OS keychain
 // ---------------------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize)]
 struct Stored {
     server: String,
-    username: String,
+    #[serde(alias = "username")]
+    email: String,
     feed_token: String,
 }
 
@@ -152,8 +153,8 @@ fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|dir| dir.join("kairo").join("session.json"))
 }
 
-fn keyring_entry(server: &str, username: &str) -> Option<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, &format!("{username}@{server}")).ok()
+fn keyring_entry(server: &str, email: &str) -> Option<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, &format!("{email}@{server}")).ok()
 }
 
 /// Remembers the session. Returns false if the token could not be put into the keychain
@@ -161,7 +162,7 @@ fn keyring_entry(server: &str, username: &str) -> Option<keyring::Entry> {
 pub fn save(session: &Session) -> bool {
     let stored = Stored {
         server: session.server.clone(),
-        username: session.username.clone(),
+        email: session.email.clone(),
         feed_token: session.feed_token.clone(),
     };
     if let Some(path) = config_path() {
@@ -172,25 +173,25 @@ pub fn save(session: &Session) -> bool {
             let _ = std::fs::write(path, json);
         }
     }
-    keyring_entry(&session.server, &session.username)
+    keyring_entry(&session.server, &session.email)
         .is_some_and(|entry| entry.set_password(&session.token).is_ok())
 }
 
 pub fn load() -> Option<Session> {
     let stored: Stored = serde_json::from_str(&std::fs::read_to_string(config_path()?).ok()?).ok()?;
-    let token = keyring_entry(&stored.server, &stored.username)?.get_password().ok()?;
-    Some(Session { server: stored.server, username: stored.username, token, feed_token: stored.feed_token })
+    let token = keyring_entry(&stored.server, &stored.email)?.get_password().ok()?;
+    Some(Session { server: stored.server, email: stored.email, token, feed_token: stored.feed_token })
 }
 
-/// Last used server and username, to prefill the login form.
+/// Last used server and email, to prefill the login form.
 pub fn last_login() -> Option<(String, String)> {
     let stored: Stored = serde_json::from_str(&std::fs::read_to_string(config_path()?).ok()?).ok()?;
-    Some((stored.server, stored.username))
+    Some((stored.server, stored.email))
 }
 
-/// Forgets the token but keeps server/username for the next login.
+/// Forgets the token but keeps server/email for the next login.
 pub fn forget_token(session: &Session) {
-    if let Some(entry) = keyring_entry(&session.server, &session.username) {
+    if let Some(entry) = keyring_entry(&session.server, &session.email) {
         let _ = entry.delete_credential();
     }
 }

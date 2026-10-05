@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod api;
 mod calendar_window;
 mod live;
@@ -264,7 +266,7 @@ impl CalendarApp {
 
     fn open_calendar_window(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(calendar) = self.calendar(id) else { return };
-        let owner = if calendar.owner.is_empty() { self.session.username.clone() } else { calendar.owner.clone() };
+        let owner = if calendar.owner.is_empty() { self.session.email.clone() } else { calendar.owner.clone() };
         let snapshot = CalendarSnapshot {
             id: calendar.id.clone(),
             name: calendar.name.clone(),
@@ -326,7 +328,7 @@ impl CalendarApp {
         self.notice = None;
         let (session, id) = (self.session.clone(), calendar_id.to_string());
         let task = cx.background_executor().spawn(async move {
-            if accept { members::accept(&session, &id) } else { members::remove(&session, &id, &session.username) }
+            if accept { members::accept(&session, &id) } else { members::remove(&session, &id, &session.email) }
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -592,7 +594,7 @@ impl CalendarApp {
                     .label("Sync")
                     .on_click(cx.listener(|this, _, _, cx| this.sync_now(cx))),
             )
-            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(self.session.username.clone()))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(self.session.email.clone()))
             .child(
                 Button::new("logout")
                     .label("Abmelden")
@@ -1361,8 +1363,15 @@ fn main() {
         .with_assets(assets::Assets)
         .run(|cx| {
             init(cx);
+            cx.set_app_identity("de.kairo.app", "Kairo");
 
             let options = WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Kairo".into()),
+                    ..Default::default()
+                }),
+                // Matches packaging/kairo.desktop (StartupWMClass) so Linux shows the icon.
+                app_id: Some("kairo".into()),
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
                     size(px(1280.), px(800.)),

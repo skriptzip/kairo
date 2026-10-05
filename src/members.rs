@@ -8,7 +8,7 @@ use crate::api::{self, Session};
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Member {
-    pub username: String,
+    pub email: String,
     pub role: String,
     pub accepted: bool,
 }
@@ -65,14 +65,14 @@ pub fn list(session: &Session, calendar_id: &str) -> Result<MemberList, String> 
     res.body_mut().read_json().map_err(|_| "Unerwartete Antwort des Servers.".to_string())
 }
 
-/// Invites `username`, or changes the role of somebody who already joined.
-pub fn invite(session: &Session, calendar_id: &str, username: &str, role: &str) -> Result<(), String> {
-    let username = username.trim().to_lowercase();
-    if username.is_empty() {
-        return Err("Bitte einen Benutzernamen eingeben.".into());
+/// Invites `email`, or changes the role of somebody who already joined.
+pub fn invite(session: &Session, calendar_id: &str, email: &str, role: &str) -> Result<(), String> {
+    let email = email.trim().to_lowercase();
+    if email.is_empty() {
+        return Err("Bitte eine E-Mail-Adresse eingeben.".into());
     }
     let mut res = api::agent()
-        .put(&url(session, calendar_id, &format!("/members/{username}")))
+        .put(&url(session, calendar_id, &format!("/members/{email}")))
         .header("Authorization", &bearer(session))
         .send_json(&json!({ "role": role }))
         .map_err(unreachable)?;
@@ -84,9 +84,9 @@ pub fn invite(session: &Session, calendar_id: &str, username: &str, role: &str) 
 }
 
 /// Removes a member or withdraws an invitation (owner), or leaves / declines (yourself).
-pub fn remove(session: &Session, calendar_id: &str, username: &str) -> Result<(), String> {
+pub fn remove(session: &Session, calendar_id: &str, email: &str) -> Result<(), String> {
     let mut res = api::agent()
-        .delete(&url(session, calendar_id, &format!("/members/{username}")))
+        .delete(&url(session, calendar_id, &format!("/members/{email}")))
         .header("Authorization", &bearer(session))
         .call()
         .map_err(unreachable)?;
@@ -139,8 +139,8 @@ mod tests {
         let server = std::env::var("KAIRO_TEST_SERVER").expect("KAIRO_TEST_SERVER");
         let id = std::process::id();
         let pw = "correct horse battery";
-        let alice = api::authenticate(&server, &format!("al{id}"), pw, true, "").unwrap();
-        let bob = api::authenticate(&server, &format!("bo{id}"), pw, true, "").unwrap();
+        let alice = api::authenticate(&server, &format!("al{id}@example.com"), pw, true, "").unwrap();
+        let bob = api::authenticate(&server, &format!("bo{id}@example.com"), pw, true, "").unwrap();
 
         // Alice has a calendar with one event.
         let mut a = Store::default();
@@ -166,8 +166,8 @@ mod tests {
         round(&mut a, &alice);
 
         // Unknown users are rejected; Bob gets an invitation and nothing else.
-        assert!(invite(&alice, &cal, "nobody-here", "editor").is_err());
-        invite(&alice, &cal, &bob.username, "editor").unwrap();
+        assert!(invite(&alice, &cal, "nobody-here@example.com", "editor").is_err());
+        invite(&alice, &cal, &bob.email, "editor").unwrap();
         let mut b = Store::default();
         round(&mut b, &bob);
         assert_eq!(b.invites.len(), 1);
@@ -191,7 +191,7 @@ mod tests {
         // The owner sees both people; downgrading Bob to viewer reaches his client.
         let members = list(&alice, &cal).unwrap();
         assert_eq!(members.members.len(), 1);
-        invite(&alice, &cal, &bob.username, "viewer").unwrap();
+        invite(&alice, &cal, &bob.email, "viewer").unwrap();
         round(&mut b, &bob);
         assert_eq!(b.calendars.iter().find(|c| c.id == cal).unwrap().role, "viewer");
 
