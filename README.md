@@ -8,11 +8,23 @@ Ein schlanker, selbst gehosteter Kalender: native Desktop-App in Rust ([GPUI](ht
 
 - **Tag-, Arbeitswochen- und Wochenansicht** mit Monatsübersicht und Kalenderliste in der Seitenleiste
 - **Mehrere Kalender** mit eigenen Farben, einzeln ein- und ausblendbar
-- **Termine** mit Titel, Ort, Beginn/Ende, Kalender und Status (*Frei*, *Mit Vorbehalt*, *Gebucht*, *Abwesend*)
+- **Termine** mit Titel, Ort, Beginn/Ende, Kalender und Status (*Frei*, *Mit Vorbehalt*, *Beschäftigt*, *Abwesend*, *An anderem Ort tätig*)
+- **Kategorien** (z. B. „Vor Ort“, „Homeoffice“) und **Privat**-Markierung: bei geteilten Kalendern sehen andere nur die Zeit
+- **Termindetails wie in Outlook**: Doppelklick zeigt zuerst alle Angaben (Zeit, Wiederholung in Worten, Ort, Kalender, Status, Erinnerung, Teilnehmer, Notizen), „Bearbeiten“ öffnet das Formular
 - **Sync zwischen Geräten** per Delta-Abgleich; Änderungen anderer Geräte erscheinen live über WebSocket
 - **Offline nutzbar**: Daten liegen lokal im Cache und werden bei der nächsten Verbindung abgeglichen
 - **Kalender teilen**: andere Konten per E-Mail einladen, mit den Rollen *Bearbeiten* oder *Ansehen*
 - **ICS-Feed** pro Kalender zum Abonnieren in anderen Kalender-Apps
+- **Serientermine**: täglich, wöchentlich, monatlich, jährlich mit Abstand, Wochentagen, „n-ter Wochentag“ und Enddatum; einzelne Termine einer Serie lassen sich löschen oder ändern
+- **Erinnerungen**: pro Termin (Beginn bis 1 Tag vorher), als Desktop-Benachrichtigung; auch aus Outlook-Dateien übernommen
+- **Suche** über Titel, Ort und Notizen (`Strg`+`F`); Klick auf einen Treffer springt zum Termin
+- **Monats- und Listenansicht** neben Tag, Arbeitswoche und Woche; **Drucken** über den Browser (`Strg`+`P`)
+- **Farbe und Zeitzone pro Termin**: Termine in anderen Zeitzonen erscheinen umgerechnet in der Zeitzone der Anzeige (einstellbar in der Seitenleiste)
+- **Mehrtägige Termine** als durchgehender Balken (ganztägig) bzw. über Mitternacht hinweg; Enddatum im Termin-Fenster
+- **Rückgängig / Wiederholen** für Änderungen an Terminen (`Strg`+`Z` / `Strg`+`Y`)
+- **Teilnehmerliste** pro Termin mit „Einladen“ (öffnet das Mailprogramm mit einer fertigen Einladung)
+- **.ics-Import und -Export**: Dateien anderer Kalender-Apps importieren, einen Kalender per Rechtsklick exportieren
+- **Outlook-Import**: Kalender aus `.pst`-Dateien übernehmen (Serien bleiben Serien, wenn Kairo sie genau abbilden kann, sonst werden sie in Einzeltermine aufgelöst)
 - **Tastenkürzel und Kontextmenüs** für die schnelle Bedienung
 - Zugangstoken wird im Schlüsselbund des Betriebssystems gespeichert, Passwörter werden serverseitig gehasht
 
@@ -87,8 +99,12 @@ KAIRO_REGISTRATION=closed docker compose up -d
 | `Esc` | Auswahl aufheben, Fenster schließen |
 | `Strg`+`T` | Zu heute springen |
 | `Strg`+`←` / `Strg`+`→` | Vorheriger / nächster Zeitraum |
-| `Strg`+`1` / `2` / `3` | Tag / Arbeitswoche / Woche |
+| `Strg`+`1` / `2` / `3` / `4` / `5` | Tag / Arbeitswoche / Woche / Monat / Liste |
+| `Strg`+`P` | Aktuelle Ansicht drucken |
 | `F5` / `Strg`+`R` | Jetzt synchronisieren |
+| `Strg`+`I` | Outlook-Datei (.pst) importieren |
+| `Strg`+`F` | Termine suchen (`Esc` leert die Suche) |
+| `Strg`+`Z` / `Strg`+`Y` | Rückgängig / Wiederholen |
 | `Strg`+`S` / `Strg`+`Enter` | Termin speichern (im Termin-Fenster) |
 
 ## Aus dem Quellcode bauen
@@ -111,7 +127,9 @@ KAIRO_TEST_SERVER=http://127.0.0.1:8099 cargo test -- --ignored
 ## Projektstruktur
 
 ```
-src/        Desktop-App (UI, Sync, Live-Updates, Login, Mitglieder)
+core/       kairo-core: Modell, Serienregeln, Sync, Live-Updates, API-Client, .ics (ohne UI, auch für Mobile)
+mobile/     Android-App (Tauri 2: Rust-Backend auf kairo-core, Web-Oberfläche in mobile/ui)
+src/        Desktop-App (GPUI-Oberfläche, Outlook-Import, Benachrichtigungen)
 server/     Sync-Server (axum + SQLite): Konten, Sync-API, WebSocket, Freigaben, ICS-Feed
 assets/     App-Icons
 packaging/  Desktop-Eintrag für Linux
@@ -121,3 +139,16 @@ docs/       Screenshots für dieses README
 ### Sync-Protokoll in Kürze
 
 Jede Änderung (auch Löschungen als Tombstones) erhält eine global aufsteigende Revision `rev`. Clients holen Änderungen mit `GET /api/v1/sync?since=<rev>` und schreiben mit optimistischer Nebenläufigkeit: `PUT /api/v1/events/{id}?base_rev=<rev>` antwortet mit `409` samt aktueller Serverversion, falls ein anderes Gerät den Termin zuvor geändert hat. Über `GET /api/v1/ws` meldet der Server neue Revisionen sofort an verbundene Clients.
+
+## Android-App (in Arbeit)
+
+Die Handy-App liegt in `mobile/` (Tauri 2) und nutzt dasselbe `kairo-core` wie die Desktop-App. Voraussetzungen: JDK 17, Android Studio mit SDK und NDK, die Umgebungsvariablen `JAVA_HOME`, `ANDROID_HOME` und `NDK_HOME`, die Rust-Targets (`rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android`) und `cargo install tauri-cli --version "^2"`.
+
+```bash
+cd mobile/src-tauri
+cargo tauri android init      # einmalig
+cargo tauri android dev       # Emulator oder angeschlossenes Handy
+cargo tauri android build --apk
+```
+
+Zum schnellen Ausprobieren der Oberfläche am PC reicht `cargo run` in `mobile/src-tauri`.

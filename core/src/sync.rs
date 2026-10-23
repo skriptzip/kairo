@@ -10,13 +10,13 @@
 
 use std::time::Duration;
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     api::Session,
     model::{
-        CalendarInfo, Event, Invite, PendingCalendarRemoval, PendingDelete, Store, default_status, default_tz, new_id,
+        CalendarInfo, Event, Exception, Invite, PendingCalendarRemoval, PendingDelete, Store, default_status, default_tz, new_id,
     },
 };
 
@@ -55,6 +55,28 @@ pub struct WireEvent {
     #[serde(default = "default_status")]
     pub status: String,
     #[serde(default)]
+    pub repeat: String,
+    #[serde(default)]
+    pub repeat_until: Option<NaiveDate>,
+    #[serde(default = "crate::model::one")]
+    pub repeat_interval: u32,
+    #[serde(default)]
+    pub repeat_days: u8,
+    #[serde(default)]
+    pub repeat_nth: i8,
+    #[serde(default)]
+    pub exceptions: Vec<Exception>,
+    #[serde(default)]
+    pub remind: Option<u32>,
+    #[serde(default)]
+    pub attendees: Vec<String>,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub private: bool,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
     pub rev: i64,
     #[serde(default)]
     pub deleted: bool,
@@ -88,6 +110,17 @@ impl From<&Event> for WireEvent {
             end: e.end,
             tz: e.tz.clone(),
             status: e.status.clone(),
+            repeat: e.repeat.clone(),
+            repeat_until: e.repeat_until,
+            repeat_interval: e.repeat_interval,
+            repeat_days: e.repeat_days,
+            repeat_nth: e.repeat_nth,
+            exceptions: e.exceptions.clone(),
+            remind: e.remind,
+            attendees: e.attendees.clone(),
+            color: e.color.clone(),
+            private: e.private,
+            categories: e.categories.clone(),
             rev: e.rev,
             deleted: false,
         }
@@ -434,6 +467,17 @@ impl Store {
                         local.end = wire.end;
                         local.tz = wire.tz;
                         local.status = wire.status;
+                        local.repeat = wire.repeat;
+                        local.repeat_until = wire.repeat_until;
+                        local.repeat_interval = wire.repeat_interval;
+                        local.repeat_days = wire.repeat_days;
+                        local.repeat_nth = wire.repeat_nth;
+                        local.exceptions = wire.exceptions;
+                        local.remind = wire.remind;
+                        local.attendees = wire.attendees;
+                        local.color = wire.color;
+                        local.private = wire.private;
+                        local.categories = wire.categories;
                     }
                 }
                 None => self.events.push(Event {
@@ -446,6 +490,17 @@ impl Store {
                     end: wire.end,
                     tz: wire.tz,
                     status: wire.status,
+                    repeat: wire.repeat,
+                    repeat_until: wire.repeat_until,
+                    repeat_interval: wire.repeat_interval,
+                    repeat_days: wire.repeat_days,
+                    repeat_nth: wire.repeat_nth,
+                    exceptions: wire.exceptions,
+                    remind: wire.remind,
+                    attendees: wire.attendees,
+                    color: wire.color,
+                    private: wire.private,
+                    categories: wire.categories,
                     rev: wire.rev,
                     dirty: false,
                     draft: false,
@@ -504,6 +559,17 @@ mod tests {
             end: dt(10),
             tz: default_tz(),
             status: default_status(),
+            repeat: String::new(),
+            repeat_until: None,
+            repeat_interval: 1,
+            repeat_days: 0,
+            repeat_nth: 0,
+            exceptions: Vec::new(),
+            remind: None,
+            attendees: Vec::new(),
+            color: None,
+            private: false,
+            categories: Vec::new(),
             rev,
             dirty,
             draft: false,
@@ -521,6 +587,17 @@ mod tests {
             end: dt(10),
             tz: default_tz(),
             status: default_status(),
+            repeat: String::new(),
+            repeat_until: None,
+            repeat_interval: 1,
+            repeat_days: 0,
+            repeat_nth: 0,
+            exceptions: Vec::new(),
+            remind: None,
+            attendees: Vec::new(),
+            color: None,
+            private: false,
+            categories: Vec::new(),
             rev,
             deleted,
         }
