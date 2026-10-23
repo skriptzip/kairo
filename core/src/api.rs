@@ -7,8 +7,9 @@ use std::{path::PathBuf, time::Duration};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::platform;
+
 pub const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
-const KEYRING_SERVICE: &str = "kairo";
 
 #[derive(Clone, Debug)]
 pub struct Session {
@@ -86,6 +87,9 @@ fn connection_error(err: ureq::Error) -> String {
 }
 
 pub fn device_name() -> String {
+    if let Some(name) = platform::device_name() {
+        return name.to_string();
+    }
     let host = std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_default();
@@ -150,11 +154,11 @@ struct Stored {
 }
 
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("kairo").join("session.json"))
+    platform::config_dir().map(|dir| dir.join("session.json"))
 }
 
-fn keyring_entry(server: &str, email: &str) -> Option<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, &format!("{email}@{server}")).ok()
+fn secret_account(server: &str, email: &str) -> String {
+    format!("{email}@{server}")
 }
 
 /// Remembers the session. Returns false if the token could not be put into the keychain
@@ -173,13 +177,13 @@ pub fn save(session: &Session) -> bool {
             let _ = std::fs::write(path, json);
         }
     }
-    keyring_entry(&session.server, &session.email)
-        .is_some_and(|entry| entry.set_password(&session.token).is_ok())
+    platform::secrets()
+        .is_some_and(|secrets| secrets.set(&secret_account(&session.server, &session.email), &session.token))
 }
 
 pub fn load() -> Option<Session> {
     let stored: Stored = serde_json::from_str(&std::fs::read_to_string(config_path()?).ok()?).ok()?;
-    let token = keyring_entry(&stored.server, &stored.email)?.get_password().ok()?;
+    let token = platform::secrets()?.get(&secret_account(&stored.server, &stored.email))?;
     Some(Session { server: stored.server, email: stored.email, token, feed_token: stored.feed_token })
 }
 
@@ -191,8 +195,8 @@ pub fn last_login() -> Option<(String, String)> {
 
 /// Forgets the token but keeps server/email for the next login.
 pub fn forget_token(session: &Session) {
-    if let Some(entry) = keyring_entry(&session.server, &session.email) {
-        let _ = entry.delete_credential();
+    if let Some(secrets) = platform::secrets() {
+        secrets.delete(&secret_account(&session.server, &session.email));
     }
 }
 

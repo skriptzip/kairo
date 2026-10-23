@@ -1,0 +1,21 @@
+[package]
+name = "kairo-core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# OS directories and keychain; mobile builds turn this off and call `platform::configure`.
+default = ["desktop"]
+desktop = ["dep:dirs", "dep:keyring"]
+
+[dependencies]
+async-channel = "2.5.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+chrono-tz = "0.10.4"
+dirs = { version = "7.0.0", optional = true }
+keyring = { version = "4.2.0", optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+ureq = { version = "3", features = ["json"] }
+uuid = { version = "1.27.0", features = ["v4"] }

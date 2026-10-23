@@ -36,7 +36,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use chrono::{NaiveDateTime, Utc};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 use share::Access;
 use serde::{Deserialize, Serialize};
@@ -57,7 +57,9 @@ fn default_status() -> String {
 }
 
 /// How the event shows up for availability, like Outlook's "Anzeigen als".
-const STATUSES: [&str; 4] = ["free", "tentative", "busy", "oof"];
+const STATUSES: [&str; 5] = ["free", "tentative", "busy", "oof", "elsewhere"];
+/// Repeat rules: every day, week, month or year on the start's day; "" = single event.
+const REPEATS: [&str; 5] = ["", "daily", "weekly", "monthly", "yearly"];
 
 fn default_color() -> String {
     "#0f6cbd".into()
@@ -86,6 +88,28 @@ fn default_role() -> String {
     "owner".into()
 }
 
+/// One repetition of a series that was deleted or changed.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Exception {
+    /// The day the repetition would normally take place.
+    date: NaiveDate,
+    #[serde(default)]
+    deleted: bool,
+    /// What differs from the series; empty fields stay as in the series.
+    #[serde(default)]
+    start: Option<NaiveDateTime>,
+    #[serde(default)]
+    end: Option<NaiveDateTime>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    location: Option<String>,
+}
+
+fn one() -> u32 {
+    1
+}
+
 /// Start and end are local wall-clock times in `tz` (an IANA zone name), like in iCalendar.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Event {
@@ -104,6 +128,39 @@ struct Event {
     /// `free`, `tentative`, `busy` (default) or `oof` (out of office).
     #[serde(default = "default_status")]
     status: String,
+    /// `daily`, `weekly`, `monthly`, `yearly` or empty for a single event.
+    #[serde(default)]
+    repeat: String,
+    /// Last day a repeating event may occur (inclusive); none = forever.
+    #[serde(default)]
+    repeat_until: Option<NaiveDate>,
+    /// Every n-th day / week / month / year.
+    #[serde(default = "one")]
+    repeat_interval: u32,
+    /// Weekly: bit mask of the weekdays (Monday = 1 ... Sunday = 64); 0 = the start's weekday.
+    #[serde(default)]
+    repeat_days: u8,
+    /// Monthly / yearly: 0 = same day of the month, 1-4 = n-th weekday of the month (the start's
+    /// weekday), -1 = last such weekday.
+    #[serde(default)]
+    repeat_nth: i8,
+    #[serde(default)]
+    exceptions: Vec<Exception>,
+    /// Minutes before the start a reminder is due; none = no reminder.
+    #[serde(default)]
+    remind: Option<u32>,
+    /// E-mail addresses of the people invited to the event.
+    #[serde(default)]
+    attendees: Vec<String>,
+    /// Own color of the event as `#rrggbb`; none = the calendar's color.
+    #[serde(default)]
+    color: Option<String>,
+    /// Only the calendar's owner sees the details; everybody else just sees "Privat".
+    #[serde(default)]
+    private: bool,
+    /// Labels such as "Vor Ort" or "Homeoffice".
+    #[serde(default)]
+    categories: Vec<String>,
     #[serde(default)]
     rev: i64,
     #[serde(default)]
@@ -242,6 +299,60 @@ fn init_db(conn: &Connection) -> rusqlite::Result<()> {
     if !has_status {
         conn.execute("ALTER TABLE events ADD COLUMN status TEXT NOT NULL DEFAULT 'busy'", [])?;
     }
+    // ... and before repeating events existed.
+    let has_repeat: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'repeat')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_repeat {
+        conn.execute("ALTER TABLE events ADD COLUMN repeat TEXT NOT NULL DEFAULT ''", [])?;
+        conn.execute("ALTER TABLE events ADD COLUMN repeat_until TEXT", [])?;
+    }
+    let has_interval: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'repeat_interval')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_interval {
+        conn.execute("ALTER TABLE events ADD COLUMN repeat_interval INTEGER NOT NULL DEFAULT 1", [])?;
+        conn.execute("ALTER TABLE events ADD COLUMN repeat_days INTEGER NOT NULL DEFAULT 0", [])?;
+        conn.execute("ALTER TABLE events ADD COLUMN repeat_nth INTEGER NOT NULL DEFAULT 0", [])?;
+        conn.execute("ALTER TABLE events ADD COLUMN exceptions TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    let has_remind: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'remind')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_remind {
+        conn.execute("ALTER TABLE events ADD COLUMN remind INTEGER", [])?;
+    }
+    let has_attendees: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'attendees')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_attendees {
+        conn.execute("ALTER TABLE events ADD COLUMN attendees TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    let has_color: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'color')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_color {
+        conn.execute("ALTER TABLE events ADD COLUMN color TEXT", [])?;
+    }
+    let has_private: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'private')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_private {
+        conn.execute("ALTER TABLE events ADD COLUMN private INTEGER NOT NULL DEFAULT 0", [])?;
+        conn.execute("ALTER TABLE events ADD COLUMN categories TEXT NOT NULL DEFAULT ''", [])?;
+    }
     auth::migrate_username_to_email(conn)?;
     share::init_db(conn)?;
     auth::init_db(conn)
@@ -261,7 +372,7 @@ fn parse_dt(text: String) -> rusqlite::Result<NaiveDateTime> {
 }
 
 const EVENT_COLUMNS: &str =
-    "id, calendar_id, title, location, description, starts_at, ends_at, tz, rev, deleted, owner, status";
+    "id, calendar_id, title, location, description, starts_at, ends_at, tz, rev, deleted, owner, status, repeat, repeat_until, repeat_interval, repeat_days, repeat_nth, exceptions, remind, attendees, color, private, categories";
 
 fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<(Event, String)> {
     let event = Event {
@@ -276,6 +387,19 @@ fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<(Event, String)> {
         rev: row.get(8)?,
         deleted: row.get(9)?,
         status: row.get(11)?,
+        repeat: row.get(12)?,
+        repeat_until: row
+            .get::<_, Option<String>>(13)?
+            .and_then(|text| NaiveDate::parse_from_str(&text, "%Y-%m-%d").ok()),
+        repeat_interval: row.get(14)?,
+        repeat_days: row.get(15)?,
+        repeat_nth: row.get(16)?,
+        exceptions: serde_json::from_str(&row.get::<_, String>(17)?).unwrap_or_default(),
+        remind: row.get(18)?,
+        attendees: serde_json::from_str(&row.get::<_, String>(19)?).unwrap_or_default(),
+        color: row.get(20)?,
+        private: row.get(21)?,
+        categories: serde_json::from_str(&row.get::<_, String>(22)?).unwrap_or_default(),
     };
     Ok((event, row.get(10)?))
 }
@@ -362,7 +486,14 @@ async fn sync(
             share::ACCESSIBLE
         ))?
         .query_map(params![user, query.since], event_from_row)?
-        .map(|row| row.map(|(event, _)| event))
+        .map(|row| {
+            row.map(|(mut event, owner)| {
+                if owner != user {
+                    hide_private(&mut event);
+                }
+                event
+            })
+        })
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let calendar_ids = tx
@@ -456,6 +587,24 @@ struct BaseRev {
     base_rev: Option<i64>,
 }
 
+/// What somebody else than the calendar's owner gets to see of a private event: when, not what.
+fn hide_private(event: &mut Event) {
+    if !event.private {
+        return;
+    }
+    event.title = "Privat".into();
+    event.location.clear();
+    event.description.clear();
+    event.attendees.clear();
+    event.categories.clear();
+    event.color = None;
+    event.remind = None;
+    for exception in &mut event.exceptions {
+        exception.title = None;
+        exception.location = None;
+    }
+}
+
 fn validate(event: &Event) -> Result<(), Error> {
     if event.title.trim().is_empty() || event.title.len() > 500 {
         return Err(Error::Invalid("title must be 1-500 characters".into()));
@@ -468,6 +617,40 @@ fn validate(event: &Event) -> Result<(), Error> {
     }
     if !STATUSES.contains(&event.status.as_str()) {
         return Err(Error::Invalid("status must be free, tentative, busy or oof".into()));
+    }
+    if !REPEATS.contains(&event.repeat.as_str()) {
+        return Err(Error::Invalid("repeat must be empty, daily, weekly, monthly or yearly".into()));
+    }
+    if event.repeat_until.is_some_and(|until| until < event.start.date()) {
+        return Err(Error::Invalid("repeat_until must not be before the start".into()));
+    }
+    if !(1..=999).contains(&event.repeat_interval) || event.repeat_days > 127 || !(-1..=4).contains(&event.repeat_nth) {
+        return Err(Error::Invalid("repeat_interval, repeat_days or repeat_nth out of range".into()));
+    }
+    if event.exceptions.len() > 1000
+        || event.exceptions.iter().any(|x| {
+            x.title.as_ref().is_some_and(|t| t.trim().is_empty() || t.len() > 500)
+                || x.location.as_ref().is_some_and(|l| l.len() > 500)
+                || x.start.zip(x.end).is_some_and(|(start, end)| end < start)
+        })
+    {
+        return Err(Error::Invalid("invalid exceptions".into()));
+    }
+    if event.remind.is_some_and(|minutes| minutes > 40_320) {
+        return Err(Error::Invalid("remind must be at most 4 weeks".into()));
+    }
+    if event.attendees.len() > 200
+        || event.attendees.iter().any(|a| a.len() > 254 || !a.contains('@') || a.chars().any(|c| c.is_whitespace() || c.is_control()))
+    {
+        return Err(Error::Invalid("attendees must be e-mail addresses".into()));
+    }
+    if event.color.as_deref().is_some_and(|c| c.len() != 7 || !c.starts_with('#') || !c[1..].chars().all(|d| d.is_ascii_hexdigit())) {
+        return Err(Error::Invalid("color must look like #rrggbb".into()));
+    }
+    if event.categories.len() > 20
+        || event.categories.iter().any(|c| c.trim().is_empty() || c.len() > 60 || c.chars().any(char::is_control))
+    {
+        return Err(Error::Invalid("categories must be 1-60 characters each, at most 20".into()));
     }
     Ok(())
 }
@@ -493,10 +676,16 @@ async fn put_event(
     if level < Access::Editor {
         return Err(share::denied(level, "this calendar is read-only for you"));
     }
+    if event.private && calendar_owner != user {
+        return Err(Error::Forbidden("only the calendar's owner can make events private"));
+    }
 
     let mut audience = Vec::new();
     match load_event(&tx, &event.id)? {
-        Some((current, _)) => {
+        Some((current, current_owner)) => {
+            if current.private && current_owner != user {
+                return Err(Error::NotFound("event")); // their details are not for you
+            }
             // Also needs write access to the calendar the event currently lives in.
             let current_level = share::access(&tx, &user, &current.calendar_id)?;
             if current_level < Access::Editor {
@@ -516,12 +705,16 @@ async fn put_event(
 
     event.rev = next_rev(&tx)?;
     tx.execute(
-        "INSERT INTO events (id, owner, calendar_id, title, location, description, starts_at, ends_at, tz, rev, deleted, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)
+        "INSERT INTO events (id, owner, calendar_id, title, location, description, starts_at, ends_at, tz, rev, deleted, status, repeat, repeat_until,
+                             repeat_interval, repeat_days, repeat_nth, exceptions, remind, attendees, color, private, categories)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
          ON CONFLICT(id) DO UPDATE SET calendar_id = excluded.calendar_id, title = excluded.title,
              location = excluded.location, description = excluded.description,
              starts_at = excluded.starts_at, ends_at = excluded.ends_at, tz = excluded.tz,
-             status = excluded.status, rev = excluded.rev, deleted = 0",
+             status = excluded.status, repeat = excluded.repeat, repeat_until = excluded.repeat_until,
+             repeat_interval = excluded.repeat_interval, repeat_days = excluded.repeat_days,
+             repeat_nth = excluded.repeat_nth, exceptions = excluded.exceptions, remind = excluded.remind,
+             attendees = excluded.attendees, color = excluded.color, private = excluded.private, categories = excluded.categories, rev = excluded.rev, deleted = 0",
         params![
             event.id,
             calendar_owner,
@@ -534,6 +727,17 @@ async fn put_event(
             event.tz,
             event.rev,
             event.status,
+            event.repeat,
+            event.repeat_until.map(|d| d.format("%Y-%m-%d").to_string()),
+            event.repeat_interval,
+            event.repeat_days,
+            event.repeat_nth,
+            if event.exceptions.is_empty() { String::new() } else { serde_json::to_string(&event.exceptions).unwrap_or_default() },
+            event.remind,
+            if event.attendees.is_empty() { String::new() } else { serde_json::to_string(&event.attendees).unwrap_or_default() },
+            event.color,
+            event.private,
+            if event.categories.is_empty() { String::new() } else { serde_json::to_string(&event.categories).unwrap_or_default() },
         ],
     )?;
     audience.extend(share::users_of(&tx, &event.calendar_id)?);
@@ -550,9 +754,12 @@ async fn delete_event(
 ) -> Result<StatusCode, Error> {
     let mut db = state.db.lock().unwrap();
     let tx = db.transaction()?;
-    let Some((current, _)) = load_event(&tx, &id)? else {
+    let Some((current, current_owner)) = load_event(&tx, &id)? else {
         return Err(Error::NotFound("event"));
     };
+    if current.private && current_owner != user {
+        return Err(Error::NotFound("event"));
+    }
     let level = share::access(&tx, &user, &current.calendar_id)?;
     if level < Access::Editor {
         return Err(if level == Access::None {
@@ -609,6 +816,40 @@ fn ics_fold(line: &str) -> String {
     out
 }
 
+const ICS_WEEKDAYS: [&str; 7] = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"];
+
+fn ics_local(tz: &str, time: NaiveDateTime) -> String {
+    format!(";TZID={tz}:{}", time.format("%Y%m%dT%H%M%S"))
+}
+
+/// The `RRULE` value of a repeating event.
+fn rrule(event: &Event) -> Option<String> {
+    let freq = match event.repeat.as_str() {
+        "daily" => "DAILY",
+        "weekly" => "WEEKLY",
+        "monthly" => "MONTHLY",
+        "yearly" => "YEARLY",
+        _ => return None,
+    };
+    let mut rule = format!("FREQ={freq}");
+    if event.repeat_interval > 1 {
+        rule += &format!(";INTERVAL={}", event.repeat_interval);
+    }
+    if freq == "WEEKLY" && event.repeat_days != 0 {
+        let days: Vec<&str> = (0..7).filter(|i| event.repeat_days >> i & 1 == 1).map(|i| ICS_WEEKDAYS[i]).collect();
+        rule += &format!(";BYDAY={}", days.join(","));
+    }
+    if matches!(freq, "MONTHLY" | "YEARLY") && event.repeat_nth != 0 {
+        let weekday = ICS_WEEKDAYS[event.start.weekday().num_days_from_monday() as usize];
+        rule += &format!(";BYDAY={}{weekday}", event.repeat_nth);
+    }
+    if let Some(until) = event.repeat_until {
+        // UNTIL must be UTC when DTSTART has a time zone: end of the last day.
+        rule += &format!(";UNTIL={}T235959Z", until.format("%Y%m%d"));
+    }
+    Some(rule)
+}
+
 fn render_ics(calendar: &Calendar, events: &[Event]) -> String {
     let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let mut lines = vec![
@@ -617,28 +858,80 @@ fn render_ics(calendar: &Calendar, events: &[Event]) -> String {
         "PRODID:-//Kairo//Sync Server//DE".into(),
         format!("X-WR-CALNAME:{}", ics_escape(&calendar.name)),
     ];
-    for event in events {
+    // One VEVENT; `changed` is the exception it stands for (a single changed repetition).
+    let push = |lines: &mut Vec<String>, event: &Event, changed: Option<&Exception>| {
+        let start = changed.and_then(|x| x.start).unwrap_or(event.start);
+        let end = changed.and_then(|x| x.end).unwrap_or(event.end);
+        let title = changed.and_then(|x| x.title.as_deref()).unwrap_or(&event.title);
+        let location = changed.and_then(|x| x.location.as_deref()).unwrap_or(&event.location);
+
         lines.push("BEGIN:VEVENT".into());
         lines.push(format!("UID:{}@kairo", event.id));
         lines.push(format!("DTSTAMP:{stamp}"));
         lines.push(format!("SEQUENCE:{}", event.rev));
-        lines.push(format!("DTSTART;TZID={}:{}", event.tz, event.start.format("%Y%m%dT%H%M%S")));
-        lines.push(format!("DTEND;TZID={}:{}", event.tz, event.end.format("%Y%m%dT%H%M%S")));
-        lines.push(format!("SUMMARY:{}", ics_escape(&event.title)));
+        if let Some(x) = changed {
+            lines.push(format!("RECURRENCE-ID{}", ics_local(&event.tz, x.date.and_time(event.start.time()))));
+        }
+        lines.push(format!("DTSTART{}", ics_local(&event.tz, start)));
+        lines.push(format!("DTEND{}", ics_local(&event.tz, end)));
+        if changed.is_none() {
+            if let Some(rule) = rrule(event) {
+                lines.push(format!("RRULE:{rule}"));
+                // Deleted and changed repetitions both leave the rule (changed ones come back below).
+                let dates: Vec<String> = event
+                    .exceptions
+                    .iter()
+                    .map(|x| x.date.and_time(event.start.time()).format("%Y%m%dT%H%M%S").to_string())
+                    .collect();
+                if !dates.is_empty() {
+                    lines.push(format!("EXDATE;TZID={}:{}", event.tz, dates.join(",")));
+                }
+            }
+        }
+        lines.push(format!("SUMMARY:{}", ics_escape(title)));
         // Free time doesn't block the calendar; "tentative" is Outlook's "Mit Vorbehalt".
-        lines.push(format!("TRANSP:{}", if event.status == "free" { "TRANSPARENT" } else { "OPAQUE" }));
+        lines.push(format!("TRANSP:{}", if matches!(event.status.as_str(), "free" | "elsewhere") { "TRANSPARENT" } else { "OPAQUE" }));
         match event.status.as_str() {
             "tentative" => lines.push("STATUS:TENTATIVE".into()),
             "oof" => lines.push("X-MICROSOFT-CDO-BUSYSTATUS:OOF".into()),
+            "elsewhere" => lines.push("X-MICROSOFT-CDO-BUSYSTATUS:WORKINGELSEWHERE".into()),
             _ => {}
         }
-        if !event.location.is_empty() {
-            lines.push(format!("LOCATION:{}", ics_escape(&event.location)));
+        if event.private {
+            lines.push("CLASS:PRIVATE".into());
+        }
+        if !event.categories.is_empty() {
+            let names: Vec<String> = event.categories.iter().map(|c| ics_escape(c)).collect();
+            lines.push(format!("CATEGORIES:{}", names.join(",")));
+        }
+        if !location.is_empty() {
+            lines.push(format!("LOCATION:{}", ics_escape(location)));
         }
         if !event.description.is_empty() {
             lines.push(format!("DESCRIPTION:{}", ics_escape(&event.description)));
         }
+        if let Some(color) = &event.color {
+            lines.push(format!("COLOR:{color}"));
+        }
+        for attendee in &event.attendees {
+            lines.push(format!("ATTENDEE;ROLE=REQ-PARTICIPANT:mailto:{attendee}"));
+        }
+        if let Some(minutes) = event.remind {
+            lines.push("BEGIN:VALARM".into());
+            lines.push("ACTION:DISPLAY".into());
+            lines.push(format!("DESCRIPTION:{}", ics_escape(title)));
+            lines.push(format!("TRIGGER:-PT{minutes}M"));
+            lines.push("END:VALARM".into());
+        }
         lines.push("END:VEVENT".into());
+    };
+    for event in events {
+        push(&mut lines, event, None);
+        if rrule(event).is_some() {
+            for exception in event.exceptions.iter().filter(|x| !x.deleted) {
+                push(&mut lines, event, Some(exception));
+            }
+        }
     }
     lines.push("END:VCALENDAR".into());
     lines.iter().map(|l| ics_fold(l) + "\r\n").collect()
@@ -670,7 +963,14 @@ async fn ics(
             "SELECT {EVENT_COLUMNS} FROM events WHERE calendar_id = ?1 AND deleted = 0 ORDER BY starts_at"
         ))?
         .query_map([&calendar_id], event_from_row)?
-        .map(|row| row.map(|(event, _)| event))
+        .map(|row| {
+            row.map(|(mut event, owner)| {
+                if owner != user {
+                    hide_private(&mut event);
+                }
+                event
+            })
+        })
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(([(header::CONTENT_TYPE, "text/calendar; charset=utf-8")], render_ics(&calendar, &events)).into_response())
 }
@@ -974,6 +1274,8 @@ mod tests {
         init_db(&conn).unwrap(); // running it again is harmless
         let status: String = conn.query_row("SELECT status FROM events WHERE id = 'e1'", [], |r| r.get(0)).unwrap();
         assert_eq!(status, "busy");
+        let repeat: String = conn.query_row("SELECT repeat FROM events WHERE id = 'e1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(repeat, "");
     }
 
     #[test]
@@ -1013,6 +1315,120 @@ mod tests {
         tentative["status"] = "maybe-ish".into();
         let (s, _) = call(&app, "PUT", "/api/v1/events/e3", token, Some(tentative)).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn repeat_rules_are_stored_and_validated() {
+        let app = app();
+        let token = &register(&app, "alice@example.com").await;
+        call(&app, "PUT", "/api/v1/calendars/c1", token, Some(json!({ "name": "Team" }))).await;
+
+        let mut weekly = event("Weekly");
+        weekly["repeat"] = "weekly".into();
+        weekly["repeat_until"] = "2026-12-31".into();
+        let (s, saved) = call(&app, "PUT", "/api/v1/events/e1", token, Some(weekly.clone())).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(saved["repeat"], "weekly");
+        let (_, sync) = call(&app, "GET", "/api/v1/sync", token, None).await;
+        let stored = sync["events"].as_array().unwrap().iter().find(|e| e["id"] == "e1").unwrap().clone();
+        assert_eq!((stored["repeat"].as_str(), stored["repeat_until"].as_str()), (Some("weekly"), Some("2026-12-31")));
+
+        // plain events stay plain
+        let (_, plain) = call(&app, "PUT", "/api/v1/events/e2", token, Some(event("Once"))).await;
+        assert_eq!(plain["repeat"], "");
+
+        weekly["remind"] = 30.into();
+        weekly["repeat_interval"] = 2.into();
+        weekly["repeat_days"] = 5.into();
+        weekly["exceptions"] = json!([{ "date": "2026-10-12", "deleted": true }, { "date": "2026-10-19", "start": "2026-10-19T10:00:00", "end": "2026-10-19T11:00:00", "title": "Neu" }]);
+        let (s, _) = call(&app, "PUT", "/api/v1/events/e4", token, Some(weekly.clone())).await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, sync) = call(&app, "GET", "/api/v1/sync", token, None).await;
+        let rich = sync["events"].as_array().unwrap().iter().find(|e| e["id"] == "e4").unwrap().clone();
+        assert_eq!((rich["repeat_interval"].as_i64(), rich["repeat_days"].as_i64()), (Some(2), Some(5)));
+        assert_eq!(rich["exceptions"][1]["title"], "Neu");
+        assert_eq!(rich["remind"], 30);
+        assert!(stored["remind"].is_null());
+        assert_eq!(rich["exceptions"][0]["deleted"], true);
+        weekly["attendees"] = json!(["bob@example.com", "carol@example.org"]);
+        let (s, _) = call(&app, "PUT", "/api/v1/events/e6", token, Some(weekly.clone())).await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, sync) = call(&app, "GET", "/api/v1/sync", token, None).await;
+        let invited = sync["events"].as_array().unwrap().iter().find(|e| e["id"] == "e6").unwrap().clone();
+        assert_eq!(invited["attendees"], json!(["bob@example.com", "carol@example.org"]));
+        weekly["attendees"] = json!(["not an address"]);
+        let (s, _) = call(&app, "PUT", "/api/v1/events/e7", token, Some(weekly.clone())).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        weekly["attendees"] = json!([]);
+        weekly["color"] = "#c42b1c".into();
+        let (s, _) = call(&app, "PUT", "/api/v1/events/e8", token, Some(weekly.clone())).await;
+        assert_eq!(s, StatusCode::OK);
+        let (_, sync) = call(&app, "GET", "/api/v1/sync", token, None).await;
+        let colored = sync["events"].as_array().unwrap().iter().find(|e| e["id"] == "e8").unwrap().clone();
+        assert_eq!(colored["color"], "#c42b1c");
+        weekly["color"] = "red".into();
+        let (s, _) = call(&app, "PUT", "/api/v1/events/e9", token, Some(weekly.clone())).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        weekly["color"] = serde_json::Value::Null;
+        weekly["remind"] = 99999.into();
+        let (s, _) = call(&app, "PUT", "/api/v1/events/e5", token, Some(weekly.clone())).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        weekly["remind"] = serde_json::Value::Null;
+        weekly["repeat_interval"] = 0.into();
+        let (s, _) = call(&app, "PUT", "/api/v1/events/e5", token, Some(weekly.clone())).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        weekly["repeat_interval"] = 1.into();
+        weekly["exceptions"] = json!([{ "date": "2026-10-12", "title": "  " }]);
+        let (s, _) = call(&app, "PUT", "/api/v1/events/e5", token, Some(weekly.clone())).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        weekly["exceptions"] = json!([]);
+
+        weekly["repeat"] = "hourly".into();
+        let (s, _) = call(&app, "PUT", "/api/v1/events/e3", token, Some(weekly.clone())).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        weekly["repeat"] = "daily".into();
+        weekly["repeat_until"] = "2026-10-01".into();
+        let (s, _) = call(&app, "PUT", "/api/v1/events/e3", token, Some(weekly)).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn private_events_are_hidden_from_others_and_labels_are_stored() {
+        let app = app();
+        let alice = &register(&app, "alice@example.com").await;
+        let bob = &register(&app, "bob@example.com").await;
+        call(&app, "PUT", "/api/v1/calendars/c1", alice, Some(json!({ "name": "Team" }))).await;
+        let invite = Some(json!({ "role": "editor" }));
+        call(&app, "PUT", "/api/v1/calendars/c1/members/bob@example.com", alice, invite).await;
+        call(&app, "POST", "/api/v1/calendars/c1/accept", bob, None).await;
+
+        let mut secret = event("Arzttermin");
+        secret["private"] = true.into();
+        secret["location"] = "Praxis".into();
+        secret["status"] = "elsewhere".into();
+        secret["categories"] = json!(["Privat", "Vor Ort"]);
+        let (s, _) = call(&app, "PUT", "/api/v1/events/e1", alice, Some(secret.clone())).await;
+        assert_eq!(s, StatusCode::OK);
+
+        // the owner sees everything, the editor only when and as what
+        let (_, mine) = call(&app, "GET", "/api/v1/sync", alice, None).await;
+        assert_eq!((mine["events"][0]["title"].as_str(), mine["events"][0]["location"].as_str()), (Some("Arzttermin"), Some("Praxis")));
+        assert_eq!(mine["events"][0]["categories"], json!(["Privat", "Vor Ort"]));
+        assert_eq!(mine["events"][0]["status"], "elsewhere");
+        let (_, theirs) = call(&app, "GET", "/api/v1/sync", bob, None).await;
+        let seen = &theirs["events"][0];
+        assert_eq!((seen["title"].as_str(), seen["location"].as_str(), seen["private"].as_bool()), (Some("Privat"), Some(""), Some(true)));
+        assert_eq!(seen["categories"], json!([]));
+        assert_eq!(seen["start"], "2026-10-05T09:00:00");
+
+        // and they can neither change nor delete it, nor make their own events private
+        assert_eq!(call(&app, "PUT", "/api/v1/events/e1", bob, Some(event("Überschrieben"))).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(call(&app, "DELETE", "/api/v1/events/e1", bob, None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(call(&app, "PUT", "/api/v1/events/e2", bob, Some(secret.clone())).await.0, StatusCode::FORBIDDEN);
+
+        let mut bad = event("X");
+        bad["categories"] = json!(["  "]);
+        assert_eq!(call(&app, "PUT", "/api/v1/events/e3", alice, Some(bad)).await.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1149,6 +1565,27 @@ mod tests {
             end: "2026-10-05T10:00:00".parse().unwrap(),
             tz: "Europe/Berlin".into(),
             status: "tentative".into(),
+            repeat: "weekly".into(),
+            repeat_until: "2026-12-31".parse().ok(),
+            repeat_interval: 2,
+            repeat_days: 0b0000101,
+            repeat_nth: 0,
+            exceptions: vec![
+                Exception { date: "2026-10-19".parse().unwrap(), deleted: true, start: None, end: None, title: None, location: None },
+                Exception {
+                    date: "2026-10-21".parse().unwrap(),
+                    deleted: false,
+                    start: "2026-10-21T11:00:00".parse().ok(),
+                    end: "2026-10-21T12:00:00".parse().ok(),
+                    title: Some("Anders".into()),
+                    location: None,
+                },
+            ],
+            remind: Some(15),
+            attendees: vec!["bob@example.com".into()],
+            color: Some("#c42b1c".into()),
+            private: false,
+            categories: vec!["Vor Ort".into(), "A, B".into()],
             rev: 3,
             deleted: false,
         };
@@ -1156,6 +1593,16 @@ mod tests {
         assert!(ics.contains("SUMMARY:A\\, B\\; C\r\n"));
         assert!(ics.contains("DTSTART;TZID=Europe/Berlin:20261005T090000\r\n"));
         assert!(ics.contains("STATUS:TENTATIVE\r\n") && ics.contains("TRANSP:OPAQUE\r\n"));
+        assert!(ics.contains("RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,WE;UNTIL=20261231T235959Z\r\n"));
+        assert!(ics.contains("EXDATE;TZID=Europe/Berlin:20261019T090000,20261021T090000\r\n"));
+        assert!(ics.contains("RECURRENCE-ID;TZID=Europe/Berlin:20261021T090000\r\n"));
+        assert!(ics.contains("DTSTART;TZID=Europe/Berlin:20261021T110000\r\n"));
+        assert!(ics.contains("SUMMARY:Anders\r\n"));
+        assert_eq!(ics.matches("BEGIN:VEVENT").count(), 2);
+        assert!(ics.contains("ATTENDEE;ROLE=REQ-PARTICIPANT:mailto:bob@example.com\r\n"));
+        assert!(ics.contains("COLOR:#c42b1c\r\n"));
+        assert!(ics.contains("CATEGORIES:Vor Ort,A\\, B\r\n"));
+        assert!(ics.contains("BEGIN:VALARM\r\nACTION:DISPLAY\r\nDESCRIPTION:A\\, B\\; C\r\nTRIGGER:-PT15M\r\nEND:VALARM\r\n"));
         assert!(ics.lines().all(|line| line.len() <= 75));
     }
 }
