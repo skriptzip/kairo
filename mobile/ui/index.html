@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Kairo</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<section id="login" class="screen" hidden>
+  <form id="login-form" autocomplete="on">
+    <h1>Kairo</h1>
+    <label>Server<input id="l-server" type="url" inputmode="url" autocapitalize="none" placeholder="https://kalender.example.com" required></label>
+    <label>E-Mail<input id="l-email" type="email" autocomplete="username" autocapitalize="none" required></label>
+    <label>Passwort<input id="l-password" type="password" autocomplete="current-password" required></label>
+    <label id="l-invite-row" hidden>Einladungscode<input id="l-invite" type="text" autocapitalize="none"></label>
+    <p id="l-error" class="error" role="alert"></p>
+    <button id="l-submit" class="primary" type="submit">Anmelden</button>
+    <button id="l-toggle" class="link" type="button">Noch kein Konto? Registrieren</button>
+  </form>
+</section>
+
+<section id="main" class="screen" hidden>
+  <header>
+    <button id="prev" class="icon" aria-label="Zurück">‹</button>
+    <button id="title" class="title" aria-label="Heute"></button>
+    <button id="next" class="icon" aria-label="Weiter">›</button>
+    <button id="menu-btn" class="icon" aria-label="Menü">⋮</button>
+  </header>
+  <nav id="tabs">
+    <button data-view="agenda" class="active">Liste</button>
+    <button data-view="month">Monat</button>
+  </nav>
+  <div id="status" hidden></div>
+  <div id="content"></div>
+  <button id="add" class="fab" aria-label="Neuer Termin">+</button>
+  <div id="menu" class="menu" hidden>
+    <button id="m-sync">Jetzt synchronisieren</button>
+    <button id="m-today">Zu heute springen</button>
+    <button id="m-logout">Abmelden</button>
+    <p id="m-account"></p>
+  </div>
+</section>
+
+<div id="sheet" class="sheet" hidden>
+  <div class="sheet-body">
+    <div id="detail" hidden></div>
+    <form id="edit" hidden>
+      <h2 id="e-heading">Neuer Termin</h2>
+      <label>Titel<input id="e-title" type="text" required></label>
+      <label>Kalender<select id="e-calendar"></select></label>
+      <label class="check"><input id="e-allday" type="checkbox"> Ganztägig</label>
+      <div class="row">
+        <label>Beginn<input id="e-sdate" type="date" required></label>
+        <label id="e-stime-row">Uhrzeit<input id="e-stime" type="time"></label>
+      </div>
+      <div class="row">
+        <label>Ende<input id="e-edate" type="date" required></label>
+        <label id="e-etime-row">Uhrzeit<input id="e-etime" type="time"></label>
+      </div>
+      <label id="e-repeat-row">Wiederholung
+        <select id="e-repeat">
+          <option value="">Keine</option>
+          <option value="daily">Täglich</option>
+          <option value="weekly">Wöchentlich</option>
+          <option value="monthly">Monatlich</option>
+          <option value="yearly">Jährlich</option>
+        </select>
+      </label>
+      <label>Ort<input id="e-location" type="text"></label>
+      <label>Notizen<textarea id="e-description" rows="3"></textarea></label>
+      <p id="e-note" class="note" hidden>Dies ist ein Serientermin: Zeit und Wiederholung lassen sich in der Desktop-App ändern.</p>
+      <p id="e-error" class="error" role="alert"></p>
+      <div class="actions">
+        <button type="button" id="e-cancel">Abbrechen</button>
+        <button type="submit" class="primary">Speichern</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
