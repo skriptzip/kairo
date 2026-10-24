@@ -49,7 +49,7 @@ function h(tag, props = {}, ...children) {
     else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
     else node.setAttribute(key, value);
   }
-  for (const child of children.flat()) {
+  for (const child of children.flat(Infinity)) {
     if (child != null) node.append(child);
   }
   return node;

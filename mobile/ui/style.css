@@ -76,7 +76,7 @@ header {
 .day-head { position: sticky; top: 0; background: var(--bg); padding: 12px 16px 4px; font-weight: 600; color: var(--muted); font-size: 14px; }
 .day-head.today { color: var(--accent); }
 .event {
-  display: flex; gap: 12px; align-items: stretch; width: 100%; text-align: left;
+  display: flex; gap: 12px; align-items: stretch; width: calc(100% - 24px); text-align: left;
   background: var(--surface); margin: 4px 12px; padding: 10px 12px; border-radius: 12px;
 }
 .event .bar { width: 4px; border-radius: 2px; flex: none; }
