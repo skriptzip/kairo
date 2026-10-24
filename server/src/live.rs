@@ -19,7 +19,7 @@ use axum::{
 use crate::{
     AppState, User, auth,
     auth::SessionId,
-    current_rev,
+    db::current_rev,
 };
 
 const PING_EVERY: Duration = Duration::from_secs(30);
@@ -40,7 +40,7 @@ fn hint(rev: i64) -> Message {
 async fn serve(mut socket: WebSocket, state: AppState, user: String, session: String) {
     // Subscribe before reading the revision so no write can slip in between.
     let mut changes = state.changes.subscribe();
-    let head = current_rev(&state.db.lock().unwrap()).unwrap_or(0);
+    let head = latest_rev(&state).await;
     if socket.send(hint(head)).await.is_err() {
         return;
     }
@@ -55,7 +55,7 @@ async fn serve(mut socket: WebSocket, state: AppState, user: String, session: St
                     Ok(_) => continue,
                     // We missed some notifications: just point at the newest state.
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        current_rev(&state.db.lock().unwrap()).unwrap_or(0)
+                        latest_rev(&state).await
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
@@ -69,7 +69,7 @@ async fn serve(mut socket: WebSocket, state: AppState, user: String, session: St
             },
             _ = ping.tick() => {
                 // Also the moment to drop sockets whose session was revoked or expired.
-                if !auth::session_valid(&state.db.lock().unwrap(), &session) {
+                if !session_still_valid(&state, &session).await {
                     break;
                 }
                 if socket.send(Message::Ping(Bytes::new())).await.is_err() {
@@ -77,5 +77,19 @@ async fn serve(mut socket: WebSocket, state: AppState, user: String, session: St
                 }
             }
         }
+    }
+}
+
+async fn latest_rev(state: &AppState) -> i64 {
+    match state.db.conn().await {
+        Ok(mut conn) => current_rev(&mut conn).await.unwrap_or(0),
+        Err(_) => 0,
+    }
+}
+
+async fn session_still_valid(state: &AppState, session: &str) -> bool {
+    match state.db.conn().await {
+        Ok(mut conn) => auth::session_valid(&mut conn, session).await,
+        Err(_) => true, // can't tell: keep the socket, the next tick asks again
     }
 }

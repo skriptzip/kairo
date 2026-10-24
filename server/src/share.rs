@@ -14,15 +14,17 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{AppState, Error, User, next_rev};
+use crate::{
+    AppState, Error, User,
+    db::{self, Conn, n, next_rev, query, s},
+};
 
-/// Ids of all calendars `?1` (an email address) may see: owned or accepted membership.
-pub const ACCESSIBLE: &str = "(SELECT id FROM calendars WHERE owner = ?1 \
-     UNION SELECT calendar_id FROM calendar_members WHERE email = ?1 AND accepted = 1)";
+/// Ids of all calendars a user may see: owned or accepted membership. Binds the email twice.
+pub const ACCESSIBLE: &str = "(SELECT id FROM calendars WHERE owner = ? \
+     UNION SELECT calendar_id FROM calendar_members WHERE email = ? AND accepted = 1)";
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Access {
@@ -32,34 +34,40 @@ pub enum Access {
     Owner,
 }
 
-pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS calendar_members (
-             calendar_id TEXT NOT NULL, email TEXT NOT NULL, role TEXT NOT NULL,
-             accepted INTEGER NOT NULL DEFAULT 0, invited_by TEXT NOT NULL,
-             PRIMARY KEY (calendar_id, email));
-         CREATE INDEX IF NOT EXISTS calendar_members_user ON calendar_members (email);",
+pub async fn init_db(conn: &mut Conn) -> db::Result<()> {
+    db::create_table(
+        conn,
+        "calendar_members",
+        "calendar_id VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL, role VARCHAR(32) NOT NULL,
+         accepted BIGINT NOT NULL DEFAULT 0, invited_by VARCHAR(255) NOT NULL,
+         PRIMARY KEY (calendar_id, email)",
     )
+    .await?;
+    db::create_index(conn, "calendar_members_user", "calendar_members", "email").await
 }
 
 /// `(owner, deleted)` of a calendar, if it exists.
-pub fn calendar_info(conn: &Connection, id: &str) -> rusqlite::Result<Option<(String, bool)>> {
-    conn.query_row("SELECT owner, deleted FROM calendars WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()
+pub async fn calendar_info(conn: &mut Conn, id: &str) -> db::Result<Option<(String, bool)>> {
+    query("SELECT owner, deleted FROM calendars WHERE id = ?")
+        .bind(id)
+        .fetch_optional(conn)
+        .await?
+        .map(|r| Ok((s(&r, 0)?, n(&r, 1)? != 0)))
+        .transpose()
 }
 
-pub fn access(conn: &Connection, user: &str, calendar_id: &str) -> rusqlite::Result<Access> {
-    let Some((owner, _)) = calendar_info(conn, calendar_id)? else { return Ok(Access::None) };
+pub async fn access(conn: &mut Conn, user: &str, calendar_id: &str) -> db::Result<Access> {
+    let Some((owner, _)) = calendar_info(conn, calendar_id).await? else { return Ok(Access::None) };
     if owner == user {
         return Ok(Access::Owner);
     }
-    let role: Option<String> = conn
-        .query_row(
-            "SELECT role FROM calendar_members WHERE calendar_id = ?1 AND email = ?2 AND accepted = 1",
-            params![calendar_id, user],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let role = query("SELECT role FROM calendar_members WHERE calendar_id = ? AND email = ? AND accepted = 1")
+        .bind(calendar_id)
+        .bind(user)
+        .fetch_optional(conn)
+        .await?
+        .map(|r| s(&r, 0))
+        .transpose()?;
     Ok(match role.as_deref() {
         Some("editor") => Access::Editor,
         Some("viewer") => Access::Viewer,
@@ -68,11 +76,16 @@ pub fn access(conn: &Connection, user: &str, calendar_id: &str) -> rusqlite::Res
 }
 
 /// Owner plus accepted members: everybody who should hear about a change.
-pub fn users_of(conn: &Connection, calendar_id: &str) -> rusqlite::Result<Vec<String>> {
-    let mut users: Vec<String> = conn
-        .prepare("SELECT owner FROM calendars WHERE id = ?1 UNION SELECT email FROM calendar_members WHERE calendar_id = ?1 AND accepted = 1")?
-        .query_map([calendar_id], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
+pub async fn users_of(conn: &mut Conn, calendar_id: &str) -> db::Result<Vec<String>> {
+    let rows = query(
+        "SELECT owner FROM calendars WHERE id = ?
+         UNION SELECT email FROM calendar_members WHERE calendar_id = ? AND accepted = 1",
+    )
+    .bind(calendar_id)
+    .bind(calendar_id)
+    .fetch_all(conn)
+    .await?;
+    let mut users = rows.iter().map(|r| s(r, 0)).collect::<db::Result<Vec<String>>>()?;
     users.sort();
     users.dedup();
     Ok(users)
@@ -86,16 +99,16 @@ pub fn denied(access: Access, what: &'static str) -> Error {
 
 /// Gives the calendar and all its events a fresh revision so every member's next delta sync
 /// includes them again.
-fn touch(conn: &Connection, calendar_id: &str, rev: i64) -> rusqlite::Result<()> {
-    conn.execute("UPDATE calendars SET rev = ?1 WHERE id = ?2", params![rev, calendar_id])?;
-    conn.execute("UPDATE events SET rev = ?1 WHERE calendar_id = ?2", params![rev, calendar_id])?;
+async fn touch(conn: &mut Conn, calendar_id: &str, rev: i64) -> db::Result<()> {
+    query("UPDATE calendars SET rev = ? WHERE id = ?").bind(rev).bind(calendar_id).execute(&mut *conn).await?;
+    query("UPDATE events SET rev = ? WHERE calendar_id = ?").bind(rev).bind(calendar_id).execute(conn).await?;
     Ok(())
 }
 
-fn require_owner(conn: &Connection, user: &str, calendar_id: &str) -> Result<(), Error> {
-    match calendar_info(conn, calendar_id)? {
+async fn require_owner(conn: &mut Conn, user: &str, calendar_id: &str) -> Result<(), Error> {
+    match calendar_info(conn, calendar_id).await? {
         Some((owner, false)) if owner == user => Ok(()),
-        Some((_, false)) => Err(denied(access(conn, user, calendar_id)?, "only the owner can do this")),
+        Some((_, false)) => Err(denied(access(conn, user, calendar_id).await?, "only the owner can do this")),
         _ => Err(Error::NotFound("calendar")),
     }
 }
@@ -109,21 +122,24 @@ pub async fn list_members(
     Extension(User(user)): Extension<User>,
     Path(id): Path<String>,
 ) -> Result<Response, Error> {
-    let db = state.db.lock().unwrap();
-    let level = access(&db, &user, &id)?;
+    let mut conn = state.db.conn().await?;
+    let level = access(&mut conn, &user, &id).await?;
     if level == Access::None {
         return Err(Error::NotFound("calendar"));
     }
-    let (owner, _) = calendar_info(&db, &id)?.ok_or(Error::NotFound("calendar"))?;
-    let members = db
-        .prepare(
-            "SELECT email, role, accepted FROM calendar_members WHERE calendar_id = ?1
-             AND (accepted = 1 OR ?2) ORDER BY email",
-        )?
-        .query_map(params![id, level == Access::Owner], |r| {
-            Ok(json!({ "email": r.get::<_, String>(0)?, "role": r.get::<_, String>(1)?, "accepted": r.get::<_, bool>(2)? }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let (owner, _) = calendar_info(&mut conn, &id).await?.ok_or(Error::NotFound("calendar"))?;
+    let rows = query(
+        "SELECT email, role, accepted FROM calendar_members WHERE calendar_id = ?
+         AND (accepted = 1 OR ? = 1) ORDER BY email",
+    )
+    .bind(&id)
+    .bind(i64::from(level == Access::Owner))
+    .fetch_all(&mut *conn)
+    .await?;
+    let members = rows
+        .iter()
+        .map(|r| Ok::<_, sqlx::Error>(json!({ "email": s(r, 0)?, "role": s(r, 1)?, "accepted": n(r, 2)? != 0 })))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(json!({ "owner": owner, "members": members })).into_response())
 }
 
@@ -146,38 +162,41 @@ pub async fn invite(
     if invitee == user {
         return Err(Error::Invalid("you already own this calendar".into()));
     }
-    let mut db = state.db.lock().unwrap();
-    let tx = db.transaction()?;
-    require_owner(&tx, &user, &id)?;
-    let exists = tx
-        .query_row("SELECT 1 FROM users WHERE email = ?1", [&invitee], |_| Ok(()))
-        .optional()?
-        .is_some();
+    let mut tx = state.db.begin().await?;
+    let rev = next_rev(&mut tx).await?; // also serializes concurrent writers
+    require_owner(&mut tx, &user, &id).await?;
+    let exists = query("SELECT email FROM users WHERE email = ?").bind(&invitee).fetch_optional(&mut *tx).await?.is_some();
     if !exists {
         return Err(Error::NotFound("user"));
     }
-    let was_accepted: bool = tx
-        .query_row(
-            "SELECT accepted FROM calendar_members WHERE calendar_id = ?1 AND email = ?2",
-            params![id, invitee],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or(false);
-    let rev = next_rev(&tx)?;
-    tx.execute(
-        "INSERT INTO calendar_members (calendar_id, email, role, accepted, invited_by)
-         VALUES (?1, ?2, ?3, 0, ?4)
-         ON CONFLICT(calendar_id, email) DO UPDATE SET role = excluded.role",
-        params![id, invitee, body.role, user],
-    )?;
+    let was_accepted = query("SELECT accepted FROM calendar_members WHERE calendar_id = ? AND email = ?")
+        .bind(&id)
+        .bind(&invitee)
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(|r| n(&r, 0))
+        .transpose()?
+        .is_some_and(|accepted| accepted != 0);
+    query(&db::upsert(
+        "calendar_members",
+        &["calendar_id", "email", "role", "accepted", "invited_by"],
+        &["calendar_id", "email"],
+        &["role"],
+    ))
+    .bind(&id)
+    .bind(&invitee)
+    .bind(&body.role)
+    .bind(0_i64)
+    .bind(&user)
+    .execute(&mut *tx)
+    .await?;
     if was_accepted {
         // The member's role changed: make it reach their client.
-        tx.execute("UPDATE calendars SET rev = ?1 WHERE id = ?2", params![rev, id])?;
+        query("UPDATE calendars SET rev = ? WHERE id = ?").bind(rev).bind(&id).execute(&mut *tx).await?;
     }
-    let mut audience = users_of(&tx, &id)?;
+    let mut audience = users_of(&mut tx, &id).await?;
     audience.push(invitee.clone());
-    tx.commit()?;
+    tx.commit().await?;
     state.notify_all(&audience, rev);
     Ok(Json(json!({ "email": invitee, "role": body.role, "accepted": was_accepted })).into_response())
 }
@@ -188,22 +207,22 @@ pub async fn accept(
     Extension(User(user)): Extension<User>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, Error> {
-    let mut db = state.db.lock().unwrap();
-    let tx = db.transaction()?;
-    if !matches!(calendar_info(&tx, &id)?, Some((_, false))) {
+    let mut tx = state.db.begin().await?;
+    let rev = next_rev(&mut tx).await?;
+    if !matches!(calendar_info(&mut tx, &id).await?, Some((_, false))) {
         return Err(Error::NotFound("invitation"));
     }
-    let n = tx.execute(
-        "UPDATE calendar_members SET accepted = 1 WHERE calendar_id = ?1 AND email = ?2 AND accepted = 0",
-        params![id, user],
-    )?;
-    if n == 0 {
+    let done = query("UPDATE calendar_members SET accepted = 1 WHERE calendar_id = ? AND email = ? AND accepted = 0")
+        .bind(&id)
+        .bind(&user)
+        .execute(&mut *tx)
+        .await?;
+    if done.rows_affected() == 0 {
         return Err(Error::NotFound("invitation"));
     }
-    let rev = next_rev(&tx)?;
-    touch(&tx, &id, rev)?;
-    let audience = users_of(&tx, &id)?;
-    tx.commit()?;
+    touch(&mut tx, &id, rev).await?;
+    let audience = users_of(&mut tx, &id).await?;
+    tx.commit().await?;
     state.notify_all(&audience, rev);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -215,23 +234,26 @@ pub async fn remove_member(
     Path((id, target)): Path<(String, String)>,
 ) -> Result<StatusCode, Error> {
     let target = target.trim().to_lowercase();
-    let mut db = state.db.lock().unwrap();
-    let tx = db.transaction()?;
-    let Some((owner, _)) = calendar_info(&tx, &id)? else { return Err(Error::NotFound("calendar")) };
+    let mut tx = state.db.begin().await?;
+    let rev = next_rev(&mut tx).await?;
+    let Some((owner, _)) = calendar_info(&mut tx, &id).await? else { return Err(Error::NotFound("calendar")) };
     if target == owner {
         return Err(Error::Invalid("the owner can't leave; delete the calendar instead".into()));
     }
     if user != owner && user != target {
-        return Err(denied(access(&tx, &user, &id)?, "only the owner can remove other members"));
+        return Err(denied(access(&mut tx, &user, &id).await?, "only the owner can remove other members"));
     }
-    let n = tx.execute("DELETE FROM calendar_members WHERE calendar_id = ?1 AND email = ?2", params![id, target])?;
-    if n == 0 {
+    let done = query("DELETE FROM calendar_members WHERE calendar_id = ? AND email = ?")
+        .bind(&id)
+        .bind(&target)
+        .execute(&mut *tx)
+        .await?;
+    if done.rows_affected() == 0 {
         return Err(Error::NotFound("member"));
     }
-    let rev = next_rev(&tx)?;
-    let mut audience = users_of(&tx, &id)?;
+    let mut audience = users_of(&mut tx, &id).await?;
     audience.push(target);
-    tx.commit()?;
+    tx.commit().await?;
     state.notify_all(&audience, rev);
     Ok(StatusCode::NO_CONTENT)
 }

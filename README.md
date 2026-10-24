@@ -1,6 +1,6 @@
 # Kairo
 
-Ein schlanker, selbst gehosteter Kalender: native Desktop-App in Rust ([GPUI](https://www.gpui.rs/)) plus ein kleiner Sync-Server mit SQLite. Eigene Daten, eigener Server, keine Cloud von Dritten.
+Ein schlanker, selbst gehosteter Kalender: native Desktop-App in Rust ([GPUI](https://www.gpui.rs/)) plus ein kleiner Sync-Server (SQLite, PostgreSQL oder MariaDB). Eigene Daten, eigener Server, keine Cloud von Dritten.
 
 ![Wochenansicht](docs/screenshots/week.png)
 
@@ -77,6 +77,7 @@ Die Konfiguration erfolgt über Umgebungsvariablen:
 | Variable | Standard | Bedeutung |
 | --- | --- | --- |
 | `KAIRO_ADDR` | `127.0.0.1:8080` | Listen-Adresse (im Docker-Image `0.0.0.0:8080`) |
+| `KAIRO_DATABASE_URL` | – | `sqlite://pfad`, `postgres://user:pw@host/db` oder `mariadb://user:pw@host/db`; hat Vorrang vor `KAIRO_DB` |
 | `KAIRO_DB` | `kairo.db` | Pfad der SQLite-Datei (im Docker-Image `/data/kairo.db`) |
 | `KAIRO_REGISTRATION` | `open` | `open` oder `closed`; nach der Registrierung aller Nutzer auf `closed` stellen |
 | `KAIRO_INVITE_CODE` | – | Wenn gesetzt, muss dieser Code bei der Registrierung angegeben werden |
@@ -130,7 +131,7 @@ KAIRO_TEST_SERVER=http://127.0.0.1:8099 cargo test -- --ignored
 core/       kairo-core: Modell, Serienregeln, Sync, Live-Updates, API-Client, .ics (ohne UI, auch für Mobile)
 mobile/     Android-App (Tauri 2: Rust-Backend auf kairo-core, Web-Oberfläche in mobile/ui)
 src/        Desktop-App (GPUI-Oberfläche, Outlook-Import, Benachrichtigungen)
-server/     Sync-Server (axum + SQLite): Konten, Sync-API, WebSocket, Freigaben, ICS-Feed
+server/     Sync-Server (axum + SQLite/PostgreSQL/MariaDB, siehe `server/README.md`): Konten, Sync-API, WebSocket, Freigaben, ICS-Feed
 assets/     App-Icons
 packaging/  Desktop-Eintrag für Linux
 docs/       Screenshots für dieses README
