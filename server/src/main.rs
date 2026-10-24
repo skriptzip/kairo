@@ -13,19 +13,23 @@
 //!
 //! Configuration (environment):
 //! - `KAIRO_ADDR`          listen address, default `127.0.0.1:8080`
-//! - `KAIRO_DB`            SQLite file, default `kairo.db`
+//! - `KAIRO_DATABASE_URL`  `sqlite://path`, `postgres://user:pass@host/db` or `mariadb://user:pass@host/db`
+//!                         (`mysql://` works too); overrides `KAIRO_DB`
+//! - `KAIRO_DB`            SQLite file, default `kairo.db` (used when no URL is set)
+//! - `KAIRO_DB_POOL`       connections to PostgreSQL / MariaDB, default 10
 //! - `KAIRO_REGISTRATION`  `open` (default) or `closed`
 //! - `KAIRO_INVITE_CODE`   if set, registration additionally requires this code
 //! - `KAIRO_TRUST_PROXY`   `1` to take the client IP from the last `X-Forwarded-For` entry
 //!                         (only behind a reverse proxy that sets it)
 
 mod auth;
+mod db;
 mod live;
 mod share;
 
 use std::{
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use axum::{
@@ -37,12 +41,15 @@ use axum::{
     routing::{get, post, put},
 };
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, params};
+use db::{Conn, Db, current_rev, n, next_rev, opt_n, opt_s, query, s};
+use sqlx::any::AnyRow;
 use share::Access;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const DT_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
+/// Request bodies above this are rejected with 413 before they are parsed.
+const MAX_BODY_BYTES: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------------------
 // Data model
@@ -172,16 +179,16 @@ struct User(String);
 
 #[derive(Clone)]
 struct AppState {
-    db: Arc<Mutex<Connection>>,
+    db: Db,
     auth: Arc<auth::AuthState>,
     /// (user, new rev) after every committed write; WebSocket clients of that user are told.
     changes: tokio::sync::broadcast::Sender<(String, i64)>,
 }
 
 impl AppState {
-    fn new(db: Connection, auth: auth::AuthState) -> Self {
+    fn new(db: Db, auth: auth::AuthState) -> Self {
         let (changes, _) = tokio::sync::broadcast::channel(256);
-        AppState { db: Arc::new(Mutex::new(db)), auth: Arc::new(auth), changes }
+        AppState { db, auth: Arc::new(auth), changes }
     }
 
     fn notify_all(&self, users: &[String], rev: i64) {
@@ -200,7 +207,7 @@ impl AppState {
 // ---------------------------------------------------------------------------------------
 
 enum Error {
-    Db(rusqlite::Error),
+    Db(sqlx::Error),
     NotFound(&'static str),
     Gone,
     Conflict(Event),
@@ -214,8 +221,8 @@ enum Error {
     Internal(String),
 }
 
-impl From<rusqlite::Error> for Error {
-    fn from(err: rusqlite::Error) -> Self {
+impl From<sqlx::Error> for Error {
+    fn from(err: sqlx::Error) -> Self {
         Error::Db(err)
     }
 }
@@ -272,145 +279,49 @@ impl IntoResponse for Error {
 // Database
 // ---------------------------------------------------------------------------------------
 
-fn init_db(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "PRAGMA journal_mode = WAL;
-         CREATE TABLE IF NOT EXISTS counter (rev INTEGER NOT NULL);
-         INSERT INTO counter SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM counter);
-         CREATE TABLE IF NOT EXISTS calendars (
-             id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, color TEXT NOT NULL,
-             rev INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
-         CREATE INDEX IF NOT EXISTS calendars_owner_rev ON calendars (owner, rev);
-         CREATE TABLE IF NOT EXISTS events (
-             id TEXT PRIMARY KEY, owner TEXT NOT NULL, calendar_id TEXT NOT NULL,
-             title TEXT NOT NULL, location TEXT NOT NULL, description TEXT NOT NULL,
-             starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, tz TEXT NOT NULL,
-             status TEXT NOT NULL DEFAULT 'busy',
-             rev INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
-         CREATE INDEX IF NOT EXISTS events_owner_rev ON events (owner, rev);
-         CREATE INDEX IF NOT EXISTS events_calendar ON events (calendar_id);",
-    )?;
-    // Databases created before `status` existed.
-    let has_status: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'status')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_status {
-        conn.execute("ALTER TABLE events ADD COLUMN status TEXT NOT NULL DEFAULT 'busy'", [])?;
-    }
-    // ... and before repeating events existed.
-    let has_repeat: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'repeat')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_repeat {
-        conn.execute("ALTER TABLE events ADD COLUMN repeat TEXT NOT NULL DEFAULT ''", [])?;
-        conn.execute("ALTER TABLE events ADD COLUMN repeat_until TEXT", [])?;
-    }
-    let has_interval: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'repeat_interval')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_interval {
-        conn.execute("ALTER TABLE events ADD COLUMN repeat_interval INTEGER NOT NULL DEFAULT 1", [])?;
-        conn.execute("ALTER TABLE events ADD COLUMN repeat_days INTEGER NOT NULL DEFAULT 0", [])?;
-        conn.execute("ALTER TABLE events ADD COLUMN repeat_nth INTEGER NOT NULL DEFAULT 0", [])?;
-        conn.execute("ALTER TABLE events ADD COLUMN exceptions TEXT NOT NULL DEFAULT ''", [])?;
-    }
-    let has_remind: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'remind')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_remind {
-        conn.execute("ALTER TABLE events ADD COLUMN remind INTEGER", [])?;
-    }
-    let has_attendees: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'attendees')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_attendees {
-        conn.execute("ALTER TABLE events ADD COLUMN attendees TEXT NOT NULL DEFAULT ''", [])?;
-    }
-    let has_color: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'color')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_color {
-        conn.execute("ALTER TABLE events ADD COLUMN color TEXT", [])?;
-    }
-    let has_private: bool = conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('events') WHERE name = 'private')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_private {
-        conn.execute("ALTER TABLE events ADD COLUMN private INTEGER NOT NULL DEFAULT 0", [])?;
-        conn.execute("ALTER TABLE events ADD COLUMN categories TEXT NOT NULL DEFAULT ''", [])?;
-    }
-    auth::migrate_username_to_email(conn)?;
-    share::init_db(conn)?;
-    auth::init_db(conn)
-}
-
-fn next_rev(conn: &Connection) -> rusqlite::Result<i64> {
-    conn.query_row("UPDATE counter SET rev = rev + 1 RETURNING rev", [], |r| r.get(0))
-}
-
-fn current_rev(conn: &Connection) -> rusqlite::Result<i64> {
-    conn.query_row("SELECT rev FROM counter", [], |r| r.get(0))
-}
-
-fn parse_dt(text: String) -> rusqlite::Result<NaiveDateTime> {
-    NaiveDateTime::parse_from_str(&text, DT_FORMAT)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))
+fn parse_dt(text: String) -> Result<NaiveDateTime, sqlx::Error> {
+    NaiveDateTime::parse_from_str(&text, DT_FORMAT).map_err(|e| sqlx::Error::Decode(Box::new(e)))
 }
 
 const EVENT_COLUMNS: &str =
-    "id, calendar_id, title, location, description, starts_at, ends_at, tz, rev, deleted, owner, status, repeat, repeat_until, repeat_interval, repeat_days, repeat_nth, exceptions, remind, attendees, color, private, categories";
+    "id, calendar_id, title, location, description, starts_at, ends_at, tz, rev, deleted, owner, status, `repeat`, repeat_until, repeat_interval, repeat_days, repeat_nth, exceptions, remind, attendees, color, private, categories";
 
-fn event_from_row(row: &rusqlite::Row) -> rusqlite::Result<(Event, String)> {
+fn event_from_row(row: &AnyRow) -> Result<(Event, String), sqlx::Error> {
+    let json_list = |i| -> Result<String, sqlx::Error> { s(row, i) };
     let event = Event {
-        id: row.get(0)?,
-        calendar_id: row.get(1)?,
-        title: row.get(2)?,
-        location: row.get(3)?,
-        description: row.get(4)?,
-        start: parse_dt(row.get(5)?)?,
-        end: parse_dt(row.get(6)?)?,
-        tz: row.get(7)?,
-        rev: row.get(8)?,
-        deleted: row.get(9)?,
-        status: row.get(11)?,
-        repeat: row.get(12)?,
-        repeat_until: row
-            .get::<_, Option<String>>(13)?
-            .and_then(|text| NaiveDate::parse_from_str(&text, "%Y-%m-%d").ok()),
-        repeat_interval: row.get(14)?,
-        repeat_days: row.get(15)?,
-        repeat_nth: row.get(16)?,
-        exceptions: serde_json::from_str(&row.get::<_, String>(17)?).unwrap_or_default(),
-        remind: row.get(18)?,
-        attendees: serde_json::from_str(&row.get::<_, String>(19)?).unwrap_or_default(),
-        color: row.get(20)?,
-        private: row.get(21)?,
-        categories: serde_json::from_str(&row.get::<_, String>(22)?).unwrap_or_default(),
+        id: s(row, 0)?,
+        calendar_id: s(row, 1)?,
+        title: s(row, 2)?,
+        location: s(row, 3)?,
+        description: s(row, 4)?,
+        start: parse_dt(s(row, 5)?)?,
+        end: parse_dt(s(row, 6)?)?,
+        tz: s(row, 7)?,
+        rev: n(row, 8)?,
+        deleted: n(row, 9)? != 0,
+        status: s(row, 11)?,
+        repeat: s(row, 12)?,
+        repeat_until: opt_s(row, 13)?.and_then(|text| NaiveDate::parse_from_str(&text, "%Y-%m-%d").ok()),
+        repeat_interval: n(row, 14)? as u32,
+        repeat_days: n(row, 15)? as u8,
+        repeat_nth: n(row, 16)? as i8,
+        exceptions: serde_json::from_str(&json_list(17)?).unwrap_or_default(),
+        remind: opt_n(row, 18)?.map(|minutes| minutes as u32),
+        attendees: serde_json::from_str(&json_list(19)?).unwrap_or_default(),
+        color: opt_s(row, 20)?,
+        private: n(row, 21)? != 0,
+        categories: serde_json::from_str(&json_list(22)?).unwrap_or_default(),
     };
-    Ok((event, row.get(10)?))
+    Ok((event, s(row, 10)?))
 }
 
-fn load_event(conn: &Connection, id: &str) -> rusqlite::Result<Option<(Event, String)>> {
-    conn.query_row(
-        &format!("SELECT {EVENT_COLUMNS} FROM events WHERE id = ?1"),
-        [id],
-        event_from_row,
-    )
-    .optional()
+async fn load_event(conn: &mut Conn, id: &str) -> Result<Option<(Event, String)>, sqlx::Error> {
+    query(&format!("SELECT {EVENT_COLUMNS} FROM events WHERE id = ?"))
+        .bind(id)
+        .fetch_optional(conn)
+        .await?
+        .map(|row| event_from_row(&row))
+        .transpose()
 }
 
 // ---------------------------------------------------------------------------------------
@@ -445,78 +356,100 @@ struct SyncResponse {
     invites: Vec<Invite>,
 }
 
-fn calendar_from_row(r: &rusqlite::Row) -> rusqlite::Result<Calendar> {
+fn calendar_from_row(r: &AnyRow) -> Result<Calendar, sqlx::Error> {
     Ok(Calendar {
-        id: r.get(0)?,
-        name: r.get(1)?,
-        color: r.get(2)?,
-        rev: r.get(3)?,
-        deleted: r.get(4)?,
-        owner: r.get(5)?,
-        role: r.get(6)?,
+        id: s(r, 0)?,
+        name: s(r, 1)?,
+        color: s(r, 2)?,
+        rev: n(r, 3)?,
+        deleted: n(r, 4)? != 0,
+        owner: s(r, 5)?,
+        role: s(r, 6)?,
     })
 }
 
-async fn sync(
-    State(state): State<AppState>,
-    Extension(User(user)): Extension<User>,
-    Query(query): Query<SyncQuery>,
-) -> Result<Json<SyncResponse>, Error> {
-    let mut db = state.db.lock().unwrap();
-    // One read transaction so `rev` matches the rows we return.
-    let tx = db.transaction()?;
-    let rev = current_rev(&tx)?;
-
-    let calendars = tx
-        .prepare(
-            "SELECT c.id, c.name, c.color, c.rev, c.deleted, c.owner,
-                    CASE WHEN c.owner = ?1 THEN 'owner' ELSE m.role END
-             FROM calendars c
-             LEFT JOIN calendar_members m
-               ON m.calendar_id = c.id AND m.email = ?1 AND m.accepted = 1
-             WHERE (c.owner = ?1 OR m.email IS NOT NULL) AND c.rev > ?2
-             ORDER BY c.rev",
-        )?
-        .query_map(params![user, query.since], calendar_from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-
-    let events = tx
-        .prepare(&format!(
-            "SELECT {EVENT_COLUMNS} FROM events WHERE calendar_id IN {} AND rev > ?2 ORDER BY rev",
-            share::ACCESSIBLE
-        ))?
-        .query_map(params![user, query.since], event_from_row)?
+/// Hides what the requesting user may not see of another owner's private events.
+fn rows_to_events(rows: &[AnyRow], user: &str) -> Result<Vec<Event>, sqlx::Error> {
+    rows.iter()
         .map(|row| {
-            row.map(|(mut event, owner)| {
+            event_from_row(row).map(|(mut event, owner)| {
                 if owner != user {
                     hide_private(&mut event);
                 }
                 event
             })
         })
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect()
+}
 
-    let calendar_ids = tx
-        .prepare(&format!("SELECT id FROM calendars WHERE deleted = 0 AND id IN {}", share::ACCESSIBLE))?
-        .query_map([&user], |r| r.get(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
+async fn sync(
+    State(state): State<AppState>,
+    Extension(User(user)): Extension<User>,
+    Query(query_params): Query<SyncQuery>,
+) -> Result<Json<SyncResponse>, Error> {
+    let mut conn = state.db.conn().await?;
+    // The revision is read first: rows that change while we read are simply sent again by
+    // the client's next sync, so `rev` never claims more than the rows we return.
+    let rev = current_rev(&mut conn).await?;
 
-    let invites = tx
-        .prepare(
-            "SELECT m.calendar_id, c.name, c.owner, m.role, m.invited_by
-             FROM calendar_members m JOIN calendars c ON c.id = m.calendar_id
-             WHERE m.email = ?1 AND m.accepted = 0 AND c.deleted = 0 ORDER BY c.name",
-        )?
-        .query_map([&user], |r| {
-            Ok(Invite {
-                calendar_id: r.get(0)?,
-                name: r.get(1)?,
-                owner: r.get(2)?,
-                role: r.get(3)?,
-                invited_by: r.get(4)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let calendars = query(
+        "SELECT c.id, c.name, c.color, c.rev, c.deleted, c.owner,
+                CASE WHEN c.owner = ? THEN 'owner' ELSE m.role END
+         FROM calendars c
+         LEFT JOIN calendar_members m
+           ON m.calendar_id = c.id AND m.email = ? AND m.accepted = 1
+         WHERE (c.owner = ? OR m.email IS NOT NULL) AND c.rev > ?
+         ORDER BY c.rev",
+    )
+    .bind(&user)
+    .bind(&user)
+    .bind(&user)
+    .bind(query_params.since)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(calendar_from_row)
+    .collect::<Result<Vec<_>, _>>()?;
+
+    let event_rows = query(&format!(
+        "SELECT {EVENT_COLUMNS} FROM events WHERE calendar_id IN {} AND rev > ? ORDER BY rev",
+        share::ACCESSIBLE
+    ))
+    .bind(&user)
+    .bind(&user)
+    .bind(query_params.since)
+    .fetch_all(&mut *conn)
+    .await?;
+    let events = rows_to_events(&event_rows, &user)?;
+
+    let calendar_ids = query(&format!("SELECT id FROM calendars WHERE deleted = 0 AND id IN {}", share::ACCESSIBLE))
+        .bind(&user)
+        .bind(&user)
+        .fetch_all(&mut *conn)
+        .await?
+        .iter()
+        .map(|r| s(r, 0))
+        .collect::<Result<Vec<String>, _>>()?;
+
+    let invites = query(
+        "SELECT m.calendar_id, c.name, c.owner, m.role, m.invited_by
+         FROM calendar_members m JOIN calendars c ON c.id = m.calendar_id
+         WHERE m.email = ? AND m.accepted = 0 AND c.deleted = 0 ORDER BY c.name",
+    )
+    .bind(&user)
+    .fetch_all(&mut *conn)
+    .await?
+    .iter()
+    .map(|r| {
+        Ok(Invite {
+            calendar_id: s(r, 0)?,
+            name: s(r, 1)?,
+            owner: s(r, 2)?,
+            role: s(r, 3)?,
+            invited_by: s(r, 4)?,
+        })
+    })
+    .collect::<Result<Vec<_>, sqlx::Error>>()?;
 
     Ok(Json(SyncResponse { rev, calendars, events, calendar_ids, invites }))
 }
@@ -535,25 +468,34 @@ async fn put_calendar(
     calendar.owner = user.clone();
     calendar.role = "owner".into();
 
-    let mut db = state.db.lock().unwrap();
-    let tx = db.transaction()?;
-    match share::calendar_info(&tx, &calendar.id)? {
+    let mut tx = state.db.begin().await?;
+    // Taking the next revision first also serializes writers, like SQLite's single writer.
+    calendar.rev = next_rev(&mut tx).await?;
+    match share::calendar_info(&mut tx, &calendar.id).await? {
         None => {}
         Some((owner, _)) if owner == user => {}
         Some(_) => {
-            return Err(share::denied(share::access(&tx, &user, &calendar.id)?, "only the owner can change a calendar"));
+            let level = share::access(&mut tx, &user, &calendar.id).await?;
+            return Err(share::denied(level, "only the owner can change a calendar"));
         }
     }
     // Calendars are last-write-wins: only name and color, conflicts are not worth a 409.
-    calendar.rev = next_rev(&tx)?;
-    tx.execute(
-        "INSERT INTO calendars (id, owner, name, color, rev, deleted) VALUES (?1, ?2, ?3, ?4, ?5, 0)
-         ON CONFLICT(id) DO UPDATE SET name = excluded.name, color = excluded.color,
-                                       rev = excluded.rev, deleted = 0",
-        params![calendar.id, user, calendar.name, calendar.color, calendar.rev],
-    )?;
-    let audience = share::users_of(&tx, &calendar.id)?;
-    tx.commit()?;
+    query(&db::upsert(
+        "calendars",
+        &["id", "owner", "name", "color", "rev", "deleted"],
+        &["id"],
+        &["name", "color", "rev", "deleted"],
+    ))
+    .bind(&calendar.id)
+    .bind(&user)
+    .bind(&calendar.name)
+    .bind(&calendar.color)
+    .bind(calendar.rev)
+    .bind(0_i64)
+    .execute(&mut *tx)
+    .await?;
+    let audience = share::users_of(&mut tx, &calendar.id).await?;
+    tx.commit().await?;
     state.notify_all(&audience, calendar.rev);
     Ok(Json(calendar))
 }
@@ -563,21 +505,24 @@ async fn delete_calendar(
     Extension(User(user)): Extension<User>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, Error> {
-    let mut db = state.db.lock().unwrap();
-    let tx = db.transaction()?;
-    match share::calendar_info(&tx, &id)? {
+    let mut tx = state.db.begin().await?;
+    let rev = next_rev(&mut tx).await?;
+    match share::calendar_info(&mut tx, &id).await? {
         None => return Err(Error::NotFound("calendar")),
         Some((owner, _)) if owner == user => {}
-        Some(_) => return Err(share::denied(share::access(&tx, &user, &id)?, "only the owner can delete a calendar")),
+        Some(_) => {
+            let level = share::access(&mut tx, &user, &id).await?;
+            return Err(share::denied(level, "only the owner can delete a calendar"));
+        }
     }
-    let rev = next_rev(&tx)?;
-    tx.execute("UPDATE calendars SET deleted = 1, rev = ?1 WHERE id = ?2", params![rev, id])?;
-    tx.execute(
-        "UPDATE events SET deleted = 1, rev = ?1 WHERE calendar_id = ?2 AND deleted = 0",
-        params![rev, id],
-    )?;
-    let audience = share::users_of(&tx, &id)?;
-    tx.commit()?;
+    query("UPDATE calendars SET deleted = 1, rev = ? WHERE id = ?").bind(rev).bind(&id).execute(&mut *tx).await?;
+    query("UPDATE events SET deleted = 1, rev = ? WHERE calendar_id = ? AND deleted = 0")
+        .bind(rev)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    let audience = share::users_of(&mut tx, &id).await?;
+    tx.commit().await?;
     state.notify_all(&audience, rev);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -666,13 +611,15 @@ async fn put_event(
     event.id = id;
     event.deleted = false;
 
-    let mut db = state.db.lock().unwrap();
-    let tx = db.transaction()?;
+    let mut tx = state.db.begin().await?;
+    // Taking the next revision first also serializes writers, so the conflict check below
+    // can't race with another write to the same event.
+    event.rev = next_rev(&mut tx).await?;
 
-    let Some((calendar_owner, false)) = share::calendar_info(&tx, &event.calendar_id)? else {
+    let Some((calendar_owner, false)) = share::calendar_info(&mut tx, &event.calendar_id).await? else {
         return Err(Error::NotFound("calendar"));
     };
-    let level = share::access(&tx, &user, &event.calendar_id)?;
+    let level = share::access(&mut tx, &user, &event.calendar_id).await?;
     if level < Access::Editor {
         return Err(share::denied(level, "this calendar is read-only for you"));
     }
@@ -681,13 +628,13 @@ async fn put_event(
     }
 
     let mut audience = Vec::new();
-    match load_event(&tx, &event.id)? {
+    match load_event(&mut tx, &event.id).await? {
         Some((current, current_owner)) => {
             if current.private && current_owner != user {
                 return Err(Error::NotFound("event")); // their details are not for you
             }
             // Also needs write access to the calendar the event currently lives in.
-            let current_level = share::access(&tx, &user, &current.calendar_id)?;
+            let current_level = share::access(&mut tx, &user, &current.calendar_id).await?;
             if current_level < Access::Editor {
                 return Err(Error::NotFound("event"));
             }
@@ -697,51 +644,54 @@ async fn put_event(
             if base_rev != Some(current.rev) {
                 return Err(Error::Conflict(current));
             }
-            audience = share::users_of(&tx, &current.calendar_id)?;
+            audience = share::users_of(&mut tx, &current.calendar_id).await?;
         }
         None if base_rev.is_some() => return Err(Error::NotFound("event")),
         None => {}
     }
 
-    event.rev = next_rev(&tx)?;
-    tx.execute(
-        "INSERT INTO events (id, owner, calendar_id, title, location, description, starts_at, ends_at, tz, rev, deleted, status, repeat, repeat_until,
-                             repeat_interval, repeat_days, repeat_nth, exceptions, remind, attendees, color, private, categories)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
-         ON CONFLICT(id) DO UPDATE SET calendar_id = excluded.calendar_id, title = excluded.title,
-             location = excluded.location, description = excluded.description,
-             starts_at = excluded.starts_at, ends_at = excluded.ends_at, tz = excluded.tz,
-             status = excluded.status, repeat = excluded.repeat, repeat_until = excluded.repeat_until,
-             repeat_interval = excluded.repeat_interval, repeat_days = excluded.repeat_days,
-             repeat_nth = excluded.repeat_nth, exceptions = excluded.exceptions, remind = excluded.remind,
-             attendees = excluded.attendees, color = excluded.color, private = excluded.private, categories = excluded.categories, rev = excluded.rev, deleted = 0",
-        params![
-            event.id,
-            calendar_owner,
-            event.calendar_id,
-            event.title,
-            event.location,
-            event.description,
-            event.start.format(DT_FORMAT).to_string(),
-            event.end.format(DT_FORMAT).to_string(),
-            event.tz,
-            event.rev,
-            event.status,
-            event.repeat,
-            event.repeat_until.map(|d| d.format("%Y-%m-%d").to_string()),
-            event.repeat_interval,
-            event.repeat_days,
-            event.repeat_nth,
-            if event.exceptions.is_empty() { String::new() } else { serde_json::to_string(&event.exceptions).unwrap_or_default() },
-            event.remind,
-            if event.attendees.is_empty() { String::new() } else { serde_json::to_string(&event.attendees).unwrap_or_default() },
-            event.color,
-            event.private,
-            if event.categories.is_empty() { String::new() } else { serde_json::to_string(&event.categories).unwrap_or_default() },
+    let json_or_empty = |empty: bool, json: String| if empty { String::new() } else { json };
+    query(&db::upsert(
+        "events",
+        &[
+            "id", "owner", "calendar_id", "title", "location", "description", "starts_at", "ends_at", "tz", "rev",
+            "deleted", "status", "`repeat`", "repeat_until", "repeat_interval", "repeat_days", "repeat_nth",
+            "exceptions", "remind", "attendees", "color", "private", "categories",
         ],
-    )?;
-    audience.extend(share::users_of(&tx, &event.calendar_id)?);
-    tx.commit()?;
+        &["id"],
+        &[
+            "calendar_id", "title", "location", "description", "starts_at", "ends_at", "tz", "status", "`repeat`",
+            "repeat_until", "repeat_interval", "repeat_days", "repeat_nth", "exceptions", "remind", "attendees",
+            "color", "private", "categories", "rev", "deleted",
+        ],
+    ))
+    .bind(&event.id)
+    .bind(&calendar_owner)
+    .bind(&event.calendar_id)
+    .bind(&event.title)
+    .bind(&event.location)
+    .bind(&event.description)
+    .bind(event.start.format(DT_FORMAT).to_string())
+    .bind(event.end.format(DT_FORMAT).to_string())
+    .bind(&event.tz)
+    .bind(event.rev)
+    .bind(0_i64)
+    .bind(&event.status)
+    .bind(&event.repeat)
+    .bind(event.repeat_until.map(|d| d.format("%Y-%m-%d").to_string()))
+    .bind(i64::from(event.repeat_interval))
+    .bind(i64::from(event.repeat_days))
+    .bind(i64::from(event.repeat_nth))
+    .bind(json_or_empty(event.exceptions.is_empty(), serde_json::to_string(&event.exceptions).unwrap_or_default()))
+    .bind(event.remind.map(i64::from))
+    .bind(json_or_empty(event.attendees.is_empty(), serde_json::to_string(&event.attendees).unwrap_or_default()))
+    .bind(event.color.clone())
+    .bind(i64::from(event.private))
+    .bind(json_or_empty(event.categories.is_empty(), serde_json::to_string(&event.categories).unwrap_or_default()))
+    .execute(&mut *tx)
+    .await?;
+    audience.extend(share::users_of(&mut tx, &event.calendar_id).await?);
+    tx.commit().await?;
     state.notify_all(&audience, event.rev);
     Ok(Json(event))
 }
@@ -752,15 +702,15 @@ async fn delete_event(
     Path(id): Path<String>,
     Query(BaseRev { base_rev }): Query<BaseRev>,
 ) -> Result<StatusCode, Error> {
-    let mut db = state.db.lock().unwrap();
-    let tx = db.transaction()?;
-    let Some((current, current_owner)) = load_event(&tx, &id)? else {
+    let mut tx = state.db.begin().await?;
+    let rev = next_rev(&mut tx).await?;
+    let Some((current, current_owner)) = load_event(&mut tx, &id).await? else {
         return Err(Error::NotFound("event"));
     };
     if current.private && current_owner != user {
         return Err(Error::NotFound("event"));
     }
-    let level = share::access(&tx, &user, &current.calendar_id)?;
+    let level = share::access(&mut tx, &user, &current.calendar_id).await?;
     if level < Access::Editor {
         return Err(if level == Access::None {
             Error::NotFound("event")
@@ -774,10 +724,9 @@ async fn delete_event(
     if base_rev.is_some_and(|rev| rev != current.rev) {
         return Err(Error::Conflict(current));
     }
-    let rev = next_rev(&tx)?;
-    tx.execute("UPDATE events SET deleted = 1, rev = ?1 WHERE id = ?2", params![rev, id])?;
-    let audience = share::users_of(&tx, &current.calendar_id)?;
-    tx.commit()?;
+    query("UPDATE events SET deleted = 1, rev = ? WHERE id = ?").bind(rev).bind(&id).execute(&mut *tx).await?;
+    let audience = share::users_of(&mut tx, &current.calendar_id).await?;
+    tx.commit().await?;
     state.notify_all(&audience, rev);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -939,45 +888,50 @@ fn render_ics(calendar: &Calendar, events: &[Event]) -> String {
 
 async fn ics(
     State(state): State<AppState>,
+    Extension(auth::ClientIp(ip)): Extension<auth::ClientIp>,
     Path(calendar_id): Path<String>,
-    Query(query): Query<IcsQuery>,
+    Query(query_params): Query<IcsQuery>,
 ) -> Result<Response, Error> {
-    let db = state.db.lock().unwrap();
+    state.auth.feed_check(&ip)?;
+    let mut conn = state.db.conn().await?;
     // The feed uses its own read-only token, never a session token (it ends up in URLs).
-    let Some(user) = auth::user_for_feed_token(&db, &query.token)? else {
+    let Some(user) = auth::user_for_feed_token(&mut conn, &query_params.token).await? else {
+        state.auth.feed_miss(&ip);
         return Err(Error::NotFound("calendar")); // don't reveal whether the id exists
     };
-    if share::access(&db, &user, &calendar_id)? == Access::None {
+    if share::access(&mut conn, &user, &calendar_id).await? == Access::None {
         return Err(Error::NotFound("calendar"));
     }
-    let calendar = db
-        .query_row(
-            "SELECT id, name, color, rev, deleted, owner, 'viewer' FROM calendars WHERE id = ?1 AND deleted = 0",
-            params![calendar_id],
-            calendar_from_row,
-        )
-        .optional()?
+    let calendar = query("SELECT id, name, color, rev, deleted, owner, 'viewer' FROM calendars WHERE id = ? AND deleted = 0")
+        .bind(&calendar_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .map(|row| calendar_from_row(&row))
+        .transpose()?
         .ok_or(Error::NotFound("calendar"))?;
-    let events = db
-        .prepare(&format!(
-            "SELECT {EVENT_COLUMNS} FROM events WHERE calendar_id = ?1 AND deleted = 0 ORDER BY starts_at"
-        ))?
-        .query_map([&calendar_id], event_from_row)?
-        .map(|row| {
-            row.map(|(mut event, owner)| {
-                if owner != user {
-                    hide_private(&mut event);
-                }
-                event
-            })
-        })
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = query(&format!(
+        "SELECT {EVENT_COLUMNS} FROM events WHERE calendar_id = ? AND deleted = 0 ORDER BY starts_at"
+    ))
+    .bind(&calendar_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let events = rows_to_events(&rows, &user)?;
     Ok(([(header::CONTENT_TYPE, "text/calendar; charset=utf-8")], render_ics(&calendar, &events)).into_response())
 }
 
 // ---------------------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------------------
+
+/// The server only speaks JSON and iCalendar: nothing in a response should be rendered or framed.
+async fn security_headers(mut res: Response) -> Response {
+    let headers = res.headers_mut();
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    headers.insert(header::CONTENT_SECURITY_POLICY, "default-src 'none'; frame-ancestors 'none'".parse().unwrap());
+    headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
+    res
+}
 
 fn router(state: AppState) -> Router {
     let protected = Router::new()
@@ -997,6 +951,9 @@ fn router(state: AppState) -> Router {
         .route("/ics/{calendar_id}", get(ics))
         .route("/healthz", get(|| async { "ok" }))
         .layer(middleware::from_fn_with_state(state.clone(), auth::client_ip))
+        .layer(middleware::map_response(security_headers))
+        // Largest legitimate body is an event with a 20 kB description and up to 1000 exceptions.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
@@ -1024,15 +981,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(if healthcheck() { 0 } else { 1 });
     }
     let addr = std::env::var("KAIRO_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".into());
-    let db_path = std::env::var("KAIRO_DB").unwrap_or_else(|_| "kairo.db".into());
+    let url = match std::env::var("KAIRO_DATABASE_URL").ok().filter(|url| !url.is_empty()) {
+        Some(url) => url,
+        None => db::sqlite_url(&std::env::var("KAIRO_DB").unwrap_or_else(|_| "kairo.db".into())),
+    };
     let config = auth::Config::from_env()?;
 
-    let conn = Connection::open(&db_path)?;
-    init_db(&conn)?;
-    let state = AppState::new(conn, auth::AuthState::new(config));
+    let db = Db::connect(&url).await?;
+    let backend = db.name();
+    let state = AppState::new(db, auth::AuthState::new(config));
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    println!("kairo-server listening on http://{addr} (db: {db_path})");
+    println!("kairo-server listening on http://{addr} (database: {backend})");
     axum::serve(listener, router(state).into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
@@ -1043,14 +1003,30 @@ mod tests {
     use axum::{body::Body, http::Request};
     use tower::ServiceExt;
 
-    fn app_with(config: auth::Config) -> Router {
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        router(AppState::new(conn, auth::AuthState::new(config)))
+    /// SQLite in memory, or the database in `TEST_DATABASE_URL` (wiped first; run such a
+    /// test run with `--test-threads=1`, the tests share one database).
+    async fn test_db() -> Db {
+        match std::env::var("TEST_DATABASE_URL") {
+            Ok(url) => {
+                let db = Db::connect(&url).await.unwrap();
+                let mut conn = db.conn().await.unwrap();
+                for table in ["events", "calendar_members", "calendars", "sessions", "users", "counter"] {
+                    query(&format!("DROP TABLE IF EXISTS {table}")).execute(&mut *conn).await.unwrap();
+                }
+                db::init(&mut conn).await.unwrap();
+                drop(conn);
+                db
+            }
+            Err(_) => Db::connect("sqlite::memory:").await.unwrap(),
+        }
     }
 
-    fn app() -> Router {
-        app_with(auth::Config::test(true, None))
+    async fn app_with(config: auth::Config) -> Router {
+        router(AppState::new(test_db().await, auth::AuthState::new(config)))
+    }
+
+    async fn app() -> Router {
+        app_with(auth::Config::test(true, None)).await
     }
 
     async fn call(app: &Router, method: &str, uri: &str, token: &str, body: Option<serde_json::Value>) -> (StatusCode, serde_json::Value) {
@@ -1086,7 +1062,7 @@ mod tests {
 
     #[tokio::test]
     async fn requires_token() {
-        let app = app();
+        let app = app().await;
         let (status, _) = call(&app, "GET", "/api/v1/sync", "wrong", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         let (status, _) = call(&app, "GET", "/api/v1/sync", "", None).await;
@@ -1095,7 +1071,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_login_logout() {
-        let app = app();
+        let app = app().await;
         let token = register(&app, "Alice@Example.com").await; // emails are case-insensitive
         let (s, me) = call(&app, "GET", "/api/v1/auth/me", &token, None).await;
         assert_eq!(s, StatusCode::OK);
@@ -1134,7 +1110,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_logins_lock_out() {
-        let app = app();
+        let app = app().await;
         register(&app, "alice@example.com").await;
         let bad = json!({ "email": "alice@example.com", "password": "wrong-wrong-wrong" });
         for _ in 0..8 {
@@ -1149,12 +1125,12 @@ mod tests {
 
     #[tokio::test]
     async fn registration_can_be_closed_or_need_invite() {
-        let closed = app_with(auth::Config::test(false, None));
+        let closed = app_with(auth::Config::test(false, None)).await;
         let body = json!({ "email": "alice@example.com", "password": PASSWORD });
         let (s, _) = call(&closed, "POST", "/api/v1/auth/register", "", Some(body.clone())).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
 
-        let invite = app_with(auth::Config::test(true, Some("sesame")));
+        let invite = app_with(auth::Config::test(true, Some("sesame"))).await;
         let (s, _) = call(&invite, "POST", "/api/v1/auth/register", "", Some(body.clone())).await;
         assert_eq!(s, StatusCode::FORBIDDEN);
         let with_code = json!({ "email": "alice@example.com", "password": PASSWORD, "invite_code": "sesame" });
@@ -1164,7 +1140,7 @@ mod tests {
 
     #[tokio::test]
     async fn password_change_revokes_other_sessions() {
-        let app = app();
+        let app = app().await;
         let laptop = register(&app, "alice@example.com").await;
         let (_, login) = call(&app, "POST", "/api/v1/auth/login", "", Some(json!({ "email": "alice@example.com", "password": PASSWORD }))).await;
         let phone = login["token"].as_str().unwrap().to_string();
@@ -1185,11 +1161,18 @@ mod tests {
 
     #[tokio::test]
     async fn feed_token_and_account_deletion() {
-        let app = app();
-        let token = register(&app, "alice@example.com").await;
+        let app = app().await;
+        let (s, reg) = call(&app, "POST", "/api/v1/auth/register", "", Some(json!({ "email": "alice@example.com", "password": PASSWORD }))).await;
+        assert_eq!(s, StatusCode::CREATED);
+        let token = reg["token"].as_str().unwrap().to_string();
+        let feed = reg["feed_token"].as_str().unwrap().to_string();
         call(&app, "PUT", "/api/v1/calendars/c1", &token, Some(json!({ "name": "Team" }))).await;
+        // only registration and rotation reveal the feed token; the server keeps just a hash
         let (_, me) = call(&app, "GET", "/api/v1/auth/me", &token, None).await;
-        let feed = me["feed_token"].as_str().unwrap().to_string();
+        assert!(me.get("feed_token").is_none());
+        let login = json!({ "email": "alice@example.com", "password": PASSWORD });
+        let (_, login) = call(&app, "POST", "/api/v1/auth/login", "", Some(login)).await;
+        assert!(login["feed_token"].is_null());
 
         // the feed accepts the feed token but not a session token
         let uri = |t: &str| format!("/ics/c1?token={t}");
@@ -1220,7 +1203,7 @@ mod tests {
 
     #[tokio::test]
     async fn event_lifecycle_with_conflicts_and_delta_sync() {
-        let app = app();
+        let app = app().await;
         let alice = &register(&app, "alice@example.com").await;
         let (s, _) = call(&app, "PUT", "/api/v1/calendars/c1", alice, Some(json!({ "name": "Team" }))).await;
         assert_eq!(s, StatusCode::OK);
@@ -1258,45 +1241,63 @@ mod tests {
         assert_eq!(delta["events"][0]["deleted"], true);
     }
 
-    #[test]
-    fn old_database_gets_status_column() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
+    /// An SQLite file written by an older version, upgraded by `db::init`. Only SQLite ever
+    /// had older versions, so these are skipped when testing another database.
+    async fn old_sqlite(statements: &[&str]) -> Option<Db> {
+        if std::env::var("TEST_DATABASE_URL").is_ok() {
+            return None;
+        }
+        let db = Db::open("sqlite::memory:").await.unwrap();
+        let mut conn = db.conn().await.unwrap();
+        for statement in statements {
+            sqlx::query(statement).execute(&mut *conn).await.unwrap();
+        }
+        db::init(&mut conn).await.unwrap();
+        db::init(&mut conn).await.unwrap(); // running it again is harmless
+        drop(conn);
+        Some(db)
+    }
+
+    #[tokio::test]
+    async fn old_database_gets_status_column() {
+        let Some(db) = old_sqlite(&[
             "CREATE TABLE events (
                  id TEXT PRIMARY KEY, owner TEXT NOT NULL, calendar_id TEXT NOT NULL,
                  title TEXT NOT NULL, location TEXT NOT NULL, description TEXT NOT NULL,
                  starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, tz TEXT NOT NULL,
-                 rev INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
-             INSERT INTO events VALUES ('e1','a','c1','t','','','2026-10-05T09:00:00','2026-10-05T10:00:00','Europe/Berlin',1,0);",
-        )
-        .unwrap();
-        init_db(&conn).unwrap();
-        init_db(&conn).unwrap(); // running it again is harmless
-        let status: String = conn.query_row("SELECT status FROM events WHERE id = 'e1'", [], |r| r.get(0)).unwrap();
-        assert_eq!(status, "busy");
-        let repeat: String = conn.query_row("SELECT repeat FROM events WHERE id = 'e1'", [], |r| r.get(0)).unwrap();
-        assert_eq!(repeat, "");
+                 rev INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0)",
+            "INSERT INTO events VALUES ('e1','a','c1','t','','','2026-10-05T09:00:00','2026-10-05T10:00:00','Europe/Berlin',1,0)",
+        ])
+        .await
+        else {
+            return;
+        };
+        let mut conn = db.conn().await.unwrap();
+        let row = query("SELECT status, `repeat` FROM events WHERE id = 'e1'").fetch_one(&mut *conn).await.unwrap();
+        assert_eq!(s(&row, 0).unwrap(), "busy");
+        assert_eq!(s(&row, 1).unwrap(), "");
     }
 
-    #[test]
-    fn old_database_gets_email_columns() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, feed_token TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
-             CREATE TABLE sessions (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, username TEXT NOT NULL, device TEXT NOT NULL, created_at INTEGER NOT NULL, last_used INTEGER NOT NULL, expires_at INTEGER NOT NULL);
-             CREATE INDEX sessions_username ON sessions (username);
-             INSERT INTO users VALUES ('alice','h','f',1);",
-        )
-        .unwrap();
-        init_db(&conn).unwrap();
-        init_db(&conn).unwrap();
-        let who: String = conn.query_row("SELECT email FROM users", [], |r| r.get(0)).unwrap();
-        assert_eq!(who, "alice");
+    #[tokio::test]
+    async fn old_database_gets_email_columns() {
+        let Some(db) = old_sqlite(&[
+            "CREATE TABLE users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, feed_token TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL)",
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, username TEXT NOT NULL, device TEXT NOT NULL, created_at INTEGER NOT NULL, last_used INTEGER NOT NULL, expires_at INTEGER NOT NULL)",
+            "CREATE INDEX sessions_username ON sessions (username)",
+            "INSERT INTO users VALUES ('alice','h','f',1)",
+        ])
+        .await
+        else {
+            return;
+        };
+        let mut conn = db.conn().await.unwrap();
+        let row = query("SELECT email FROM users").fetch_one(&mut *conn).await.unwrap();
+        assert_eq!(s(&row, 0).unwrap(), "alice");
     }
 
     #[tokio::test]
     async fn event_status_is_stored_and_validated() {
-        let app = app();
+        let app = app().await;
         let token = &register(&app, "alice@example.com").await;
         call(&app, "PUT", "/api/v1/calendars/c1", token, Some(json!({ "name": "Team" }))).await;
 
@@ -1319,7 +1320,7 @@ mod tests {
 
     #[tokio::test]
     async fn repeat_rules_are_stored_and_validated() {
-        let app = app();
+        let app = app().await;
         let token = &register(&app, "alice@example.com").await;
         call(&app, "PUT", "/api/v1/calendars/c1", token, Some(json!({ "name": "Team" }))).await;
 
@@ -1394,7 +1395,7 @@ mod tests {
 
     #[tokio::test]
     async fn private_events_are_hidden_from_others_and_labels_are_stored() {
-        let app = app();
+        let app = app().await;
         let alice = &register(&app, "alice@example.com").await;
         let bob = &register(&app, "bob@example.com").await;
         call(&app, "PUT", "/api/v1/calendars/c1", alice, Some(json!({ "name": "Team" }))).await;
@@ -1433,7 +1434,7 @@ mod tests {
 
     #[tokio::test]
     async fn sharing_invites_roles_and_leaving() {
-        let app = app();
+        let app = app().await;
         let alice = &register(&app, "alice@example.com").await;
         let bob = &register(&app, "bob@example.com").await;
         let carol = &register(&app, "carol@example.com").await;
@@ -1511,7 +1512,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_a_shared_calendar_reaches_members() {
-        let app = app();
+        let app = app().await;
         let alice = &register(&app, "alice@example.com").await;
         let bob = &register(&app, "bob@example.com").await;
         call(&app, "PUT", "/api/v1/calendars/c1", alice, Some(json!({ "name": "Team" }))).await;
@@ -1537,7 +1538,7 @@ mod tests {
 
     #[tokio::test]
     async fn users_are_isolated() {
-        let app = app();
+        let app = app().await;
         let alice = &register(&app, "alice@example.com").await;
         let bob = &register(&app, "bob@example.com").await;
         call(&app, "PUT", "/api/v1/calendars/c1", alice, Some(json!({ "name": "Team" }))).await;

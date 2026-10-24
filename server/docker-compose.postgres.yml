@@ -1,0 +1,33 @@
+# Kairo sync server on PostgreSQL.
+#   docker compose -f docker-compose.postgres.yml up -d
+services:
+  kairo:
+    image: ghcr.io/skriptzip/kairo:latest
+    restart: unless-stopped
+    ports:
+      # Only reachable from this machine; put a TLS reverse proxy in front for remote use
+      # (and set KAIRO_TRUST_PROXY: "1" below).
+      - "127.0.0.1:8080:8080"
+    environment:
+      KAIRO_DATABASE_URL: postgres://kairo:${DB_PASSWORD:?set DB_PASSWORD}@db/kairo
+      KAIRO_REGISTRATION: open
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kairo
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD}
+      POSTGRES_DB: kairo
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kairo"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  db-data:

@@ -5,7 +5,8 @@
 //!   Only its SHA-256 is stored, so a leaked database does not leak usable tokens.
 //! - Sessions expire after 30 days of inactivity and can be revoked individually.
 //! - Failed logins are rate limited per client IP and per email; registrations per IP.
-//! - The iCalendar feed uses a separate, rotatable read-only `feed_token` per user.
+//! - The iCalendar feed uses a separate, rotatable read-only `feed_token` per user. Like session
+//!   tokens it is stored hashed, so it is only returned once, at registration or rotation.
 
 use std::{
     collections::HashMap,
@@ -27,13 +28,15 @@ use axum::{
     routing::{delete, get, post},
 };
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
-use crate::{AppState, Error, User};
+use crate::{
+    AppState, Error, User,
+    db::{self, Conn, n, query, s},
+};
 
 const SESSION_TTL_SECS: i64 = 30 * 24 * 3600;
 /// `last_used` / expiry are only refreshed when older than this, to avoid a write per request.
@@ -95,33 +98,65 @@ impl AuthState {
     }
 }
 
+const FEED_MISS_WINDOW: Duration = Duration::from_secs(15 * 60);
+const FEED_MISS_MAX_PER_IP: u32 = 30;
+
+impl AuthState {
+    /// Errors if this IP guessed wrong feed tokens too often.
+    pub fn feed_check(&self, ip: &str) -> Result<(), Error> {
+        self.limiter.check(&format!("feed:{ip}"), FEED_MISS_MAX_PER_IP)
+    }
+
+    pub fn feed_miss(&self, ip: &str) {
+        self.limiter.hit(&format!("feed:{ip}"), FEED_MISS_WINDOW);
+    }
+}
+
 /// Databases created when accounts still had usernames: the columns are renamed in place.
-pub fn migrate_username_to_email(conn: &Connection) -> rusqlite::Result<()> {
+pub async fn migrate_username_to_email(conn: &mut Conn) -> db::Result<()> {
     for table in ["users", "sessions", "calendar_members"] {
-        let old: bool = conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = 'username')",
-            [table],
-            |r| r.get(0),
-        )?;
-        if old {
-            conn.execute(&format!("ALTER TABLE {table} RENAME COLUMN username TO email"), [])?;
+        if db::sqlite_has_column(conn, table, "username").await? {
+            query(&format!("ALTER TABLE {table} RENAME COLUMN username TO email")).execute(&mut *conn).await?;
         }
     }
-    conn.execute("DROP INDEX IF EXISTS sessions_username", [])?;
+    query("DROP INDEX IF EXISTS sessions_username").execute(conn).await?;
     Ok(())
 }
 
-pub fn init_db(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS users (
-             email TEXT PRIMARY KEY, password_hash TEXT NOT NULL,
-             feed_token TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
-         CREATE TABLE IF NOT EXISTS sessions (
-             id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, email TEXT NOT NULL,
-             device TEXT NOT NULL, created_at INTEGER NOT NULL, last_used INTEGER NOT NULL,
-             expires_at INTEGER NOT NULL);
-         CREATE INDEX IF NOT EXISTS sessions_email ON sessions (email);",
+pub async fn init_db(conn: &mut Conn) -> db::Result<()> {
+    db::create_table(
+        conn,
+        "users",
+        "email VARCHAR(255) PRIMARY KEY, password_hash VARCHAR(512) NOT NULL,
+         feed_token VARCHAR(255) NOT NULL UNIQUE, created_at BIGINT NOT NULL",
     )
+    .await?;
+    db::create_table(
+        conn,
+        "sessions",
+        "id VARCHAR(255) PRIMARY KEY, token_hash VARCHAR(255) NOT NULL UNIQUE, email VARCHAR(255) NOT NULL,
+         device VARCHAR(255) NOT NULL, created_at BIGINT NOT NULL, last_used BIGINT NOT NULL,
+         expires_at BIGINT NOT NULL",
+    )
+    .await?;
+    db::create_index(conn, "sessions_email", "sessions", "email").await?;
+    hash_plain_feed_tokens(conn).await
+}
+
+/// Feed tokens used to be stored as given (48 hex chars); hashes are 64.
+async fn hash_plain_feed_tokens(conn: &mut Conn) -> db::Result<()> {
+    let rows = query("SELECT email, feed_token FROM users").fetch_all(&mut *conn).await?;
+    for row in &rows {
+        let token = s(row, 1)?;
+        if token.len() != 64 {
+            query("UPDATE users SET feed_token = ? WHERE email = ?")
+                .bind(hash_token(&token))
+                .bind(s(row, 0)?)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------
@@ -168,14 +203,17 @@ impl Limiter {
 // ---------------------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct ClientIp(String);
+pub struct ClientIp(pub String);
 
 #[derive(Clone)]
 pub struct SessionId(pub String);
 
-pub fn session_valid(db: &Connection, id: &str) -> bool {
-    db.query_row("SELECT 1 FROM sessions WHERE id = ?1 AND expires_at > ?2", params![id, now()], |_| Ok(()))
-        .optional()
+pub async fn session_valid(conn: &mut Conn, id: &str) -> bool {
+    query("SELECT id FROM sessions WHERE id = ? AND expires_at > ?")
+        .bind(id)
+        .bind(now())
+        .fetch_optional(conn)
+        .await
         .ok()
         .flatten()
         .is_some()
@@ -279,29 +317,45 @@ fn short_device(device: Option<String>) -> String {
 }
 
 /// Creates a session and returns its bearer token (shown to the client exactly once).
-fn create_session(db: &Connection, email: &str, device: &str) -> rusqlite::Result<String> {
+async fn create_session(conn: &mut Conn, email: &str, device: &str) -> db::Result<String> {
     let token = random_hex(32);
     let t = now();
-    db.execute("DELETE FROM sessions WHERE expires_at < ?1", [t])?;
-    db.execute(
+    query("DELETE FROM sessions WHERE expires_at < ?").bind(t).execute(&mut *conn).await?;
+    query(
         "INSERT INTO sessions (id, token_hash, email, device, created_at, last_used, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6)",
-        params![random_hex(8), hash_token(&token), email, device, t, t + SESSION_TTL_SECS],
-    )?;
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(random_hex(8))
+    .bind(hash_token(&token))
+    .bind(email)
+    .bind(device)
+    .bind(t)
+    .bind(t)
+    .bind(t + SESSION_TTL_SECS)
+    .execute(&mut *conn)
+    .await?;
     // Keep only the newest sessions so abandoned devices cannot pile up.
-    db.execute(
-        "DELETE FROM sessions WHERE email = ?1 AND id NOT IN
-           (SELECT id FROM sessions WHERE email = ?1 ORDER BY last_used DESC, created_at DESC LIMIT ?2)",
-        params![email, MAX_SESSIONS_PER_USER],
-    )?;
+    let ids = query("SELECT id FROM sessions WHERE email = ? ORDER BY last_used DESC, created_at DESC")
+        .bind(email)
+        .fetch_all(&mut *conn)
+        .await?;
+    for row in ids.iter().skip(MAX_SESSIONS_PER_USER as usize) {
+        query("DELETE FROM sessions WHERE id = ?").bind(s(row, 0)?).execute(&mut *conn).await?;
+    }
     Ok(token)
 }
 
-pub fn user_for_feed_token(db: &Connection, token: &str) -> rusqlite::Result<Option<String>> {
-    db.query_row("SELECT email FROM users WHERE feed_token = ?1", [token], |r| r.get(0)).optional()
+pub async fn user_for_feed_token(conn: &mut Conn, token: &str) -> db::Result<Option<String>> {
+    query("SELECT email FROM users WHERE feed_token = ?")
+        .bind(hash_token(token))
+        .fetch_optional(conn)
+        .await?
+        .map(|row| s(&row, 0))
+        .transpose()
 }
 
-fn session_response(status: StatusCode, token: &str, email: &str, feed_token: &str) -> Response {
+/// `feed_token` is only known in plain text when it was just created (registration).
+fn session_response(status: StatusCode, token: &str, email: &str, feed_token: Option<&str>) -> Response {
     (status, Json(json!({ "token": token, "email": email, "feed_token": feed_token }))).into_response()
 }
 
@@ -338,23 +392,24 @@ pub async fn require_session(State(state): State<AppState>, mut req: Request, ne
         .ok_or(Error::Unauthorized("missing bearer token"))?;
     let token_hash = hash_token(token);
     let t = now();
+    // The connection goes back to the pool before the request runs.
     let (id, email) = {
-        let db = state.db.lock().unwrap();
-        let row: Option<(String, String, i64, i64)> = db
-            .query_row(
-                "SELECT id, email, expires_at, last_used FROM sessions WHERE token_hash = ?1",
-                [&token_hash],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?;
-        let Some((id, email, _, last_used)) = row.filter(|row| row.2 > t) else {
+        let mut conn = state.db.conn().await?;
+        let row = query("SELECT id, email, expires_at, last_used FROM sessions WHERE token_hash = ?")
+            .bind(&token_hash)
+            .fetch_optional(&mut *conn)
+            .await?;
+        let found = row.map(|r| Ok::<_, sqlx::Error>((s(&r, 0)?, s(&r, 1)?, n(&r, 2)?, n(&r, 3)?))).transpose()?;
+        let Some((id, email, _, last_used)) = found.filter(|row| row.2 > t) else {
             return Err(Error::Unauthorized("invalid or expired token"));
         };
         if t - last_used > TOUCH_AFTER_SECS {
-            db.execute(
-                "UPDATE sessions SET last_used = ?1, expires_at = ?2 WHERE id = ?3",
-                params![t, t + SESSION_TTL_SECS, id],
-            )?;
+            query("UPDATE sessions SET last_used = ?, expires_at = ? WHERE id = ?")
+                .bind(t)
+                .bind(t + SESSION_TTL_SECS)
+                .bind(&id)
+                .execute(&mut *conn)
+                .await?;
         }
         (id, email)
     };
@@ -416,20 +471,25 @@ async fn register(
 
     let password_hash = hash_async(&state, body.password).await?;
     let feed_token = random_hex(24);
-    let db = state.db.lock().unwrap();
-    let inserted = db.execute(
-        "INSERT INTO users (email, password_hash, feed_token, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![email, password_hash, feed_token, now()],
-    );
-    match inserted {
-        Ok(_) => {}
-        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
-            return Err(Error::Taken);
-        }
-        Err(e) => return Err(e.into()),
+    let mut conn = state.db.conn().await?;
+    let inserted = query("INSERT INTO users (email, password_hash, feed_token, created_at) VALUES (?, ?, ?, ?)")
+        .bind(&email)
+        .bind(password_hash)
+        .bind(hash_token(&feed_token))
+        .bind(now())
+        .execute(&mut *conn)
+        .await;
+    if let Err(err) = inserted {
+        // Whatever the driver calls a duplicate key, the account existing is what matters.
+        let taken = query("SELECT email FROM users WHERE email = ?")
+            .bind(&email)
+            .fetch_optional(&mut *conn)
+            .await?
+            .is_some();
+        return Err(if taken { Error::Taken } else { err.into() });
     }
-    let token = create_session(&db, &email, &short_device(body.device))?;
-    Ok(session_response(StatusCode::CREATED, &token, &email, &feed_token))
+    let token = create_session(&mut conn, &email, &short_device(body.device)).await?;
+    Ok(session_response(StatusCode::CREATED, &token, &email, Some(&feed_token)))
 }
 
 #[derive(Deserialize)]
@@ -452,45 +512,37 @@ async fn login(
     limiter.check(&ip_key, LOGIN_MAX_PER_IP)?;
     limiter.check(&user_key, LOGIN_MAX_PER_USER)?;
 
-    let stored: Option<(String, String)> = state
-        .db
-        .lock()
-        .unwrap()
-        .query_row(
-            "SELECT password_hash, feed_token FROM users WHERE email = ?1",
-            [&email],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let (hash, feed_token) = match stored {
-        Some((hash, feed)) => (Some(hash), feed),
-        None => (None, String::new()),
+    let stored = {
+        let mut conn = state.db.conn().await?;
+        let row = query("SELECT password_hash FROM users WHERE email = ?")
+            .bind(&email)
+            .fetch_optional(&mut *conn)
+            .await?;
+        row.map(|r| s(&r, 0)).transpose()?
     };
-    let ok = verify_async(&state, body.password, hash).await?;
+    let ok = verify_async(&state, body.password, stored).await?;
     if !ok {
         limiter.hit(&ip_key, LOGIN_WINDOW);
         limiter.hit(&user_key, LOGIN_WINDOW);
         return Err(Error::Unauthorized("invalid email or password"));
     }
     limiter.clear(&user_key);
-    let token = create_session(&state.db.lock().unwrap(), &email, &short_device(body.device))?;
-    Ok(session_response(StatusCode::OK, &token, &email, &feed_token))
+    let mut conn = state.db.conn().await?;
+    let token = create_session(&mut conn, &email, &short_device(body.device)).await?;
+    Ok(session_response(StatusCode::OK, &token, &email, None))
 }
 
 async fn me(State(state): State<AppState>, Extension(User(email)): Extension<User>) -> Result<Response, Error> {
-    let (feed_token, created_at): (String, i64) = state.db.lock().unwrap().query_row(
-        "SELECT feed_token, created_at FROM users WHERE email = ?1",
-        [&email],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    Ok(Json(json!({ "email": email, "feed_token": feed_token, "created_at": created_at })).into_response())
+    let mut conn = state.db.conn().await?;
+    let row = query("SELECT created_at FROM users WHERE email = ?").bind(&email).fetch_one(&mut *conn).await?;
+    Ok(Json(json!({ "email": email, "created_at": n(&row, 0)? })).into_response())
 }
 
 async fn logout(
     State(state): State<AppState>,
     Extension(SessionId(id)): Extension<SessionId>,
 ) -> Result<StatusCode, Error> {
-    state.db.lock().unwrap().execute("DELETE FROM sessions WHERE id = ?1", [id])?;
+    query("DELETE FROM sessions WHERE id = ?").bind(id).execute(&mut *state.db.conn().await?).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -499,20 +551,24 @@ async fn list_sessions(
     Extension(User(email)): Extension<User>,
     Extension(SessionId(current)): Extension<SessionId>,
 ) -> Result<Response, Error> {
-    let db = state.db.lock().unwrap();
-    let sessions = db
-        .prepare(
-            "SELECT id, device, created_at, last_used FROM sessions
-             WHERE email = ?1 AND expires_at > ?2 ORDER BY last_used DESC",
-        )?
-        .query_map(params![email, now()], |r| {
-            let id: String = r.get(0)?;
-            Ok(json!({
-                "current": id == current, "id": id, "device": r.get::<_, String>(1)?,
-                "created_at": r.get::<_, i64>(2)?, "last_used": r.get::<_, i64>(3)?,
+    let rows = query(
+        "SELECT id, device, created_at, last_used FROM sessions
+         WHERE email = ? AND expires_at > ? ORDER BY last_used DESC",
+    )
+    .bind(email)
+    .bind(now())
+    .fetch_all(&mut *state.db.conn().await?)
+    .await?;
+    let sessions = rows
+        .iter()
+        .map(|r| {
+            let id = s(r, 0)?;
+            Ok::<_, sqlx::Error>(json!({
+                "current": id == current, "id": id, "device": s(r, 1)?,
+                "created_at": n(r, 2)?, "last_used": n(r, 3)?,
             }))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(sessions).into_response())
 }
 
@@ -521,23 +577,26 @@ async fn revoke_session(
     Extension(User(email)): Extension<User>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, Error> {
-    let n = state
-        .db
-        .lock()
-        .unwrap()
-        .execute("DELETE FROM sessions WHERE id = ?1 AND email = ?2", params![id, email])?;
-    if n == 0 { Err(Error::NotFound("session")) } else { Ok(StatusCode::NO_CONTENT) }
+    let done = query("DELETE FROM sessions WHERE id = ? AND email = ?")
+        .bind(id)
+        .bind(email)
+        .execute(&mut *state.db.conn().await?)
+        .await?;
+    if done.rows_affected() == 0 { Err(Error::NotFound("session")) } else { Ok(StatusCode::NO_CONTENT) }
 }
 
 /// Re-checks the current password for sensitive actions, sharing the login lockout.
 async fn confirm_password(state: &AppState, email: &str, password: String) -> Result<(), Error> {
     let key = format!("login-user:{email}");
     state.auth.limiter.check(&key, LOGIN_MAX_PER_USER)?;
-    let stored: String = state.db.lock().unwrap().query_row(
-        "SELECT password_hash FROM users WHERE email = ?1",
-        [email],
-        |r| r.get(0),
-    )?;
+    let stored = {
+        let mut conn = state.db.conn().await?;
+        let row = query("SELECT password_hash FROM users WHERE email = ?")
+            .bind(email)
+            .fetch_one(&mut *conn)
+            .await?;
+        s(&row, 0)?
+    };
     if verify_async(state, password, Some(stored)).await? {
         state.auth.limiter.clear(&key);
         Ok(())
@@ -563,11 +622,10 @@ async fn change_password(
     validate_password(&body.new_password, &email)?;
     confirm_password(&state, &email, body.current_password).await?;
     let new_hash = hash_async(&state, body.new_password).await?;
-    let mut db = state.db.lock().unwrap();
-    let tx = db.transaction()?;
-    tx.execute("UPDATE users SET password_hash = ?1 WHERE email = ?2", params![new_hash, email])?;
-    tx.execute("DELETE FROM sessions WHERE email = ?1 AND id != ?2", params![email, current])?;
-    tx.commit()?;
+    let mut tx = state.db.begin().await?;
+    query("UPDATE users SET password_hash = ? WHERE email = ?").bind(new_hash).bind(&email).execute(&mut *tx).await?;
+    query("DELETE FROM sessions WHERE email = ? AND id != ?").bind(&email).bind(current).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -577,11 +635,11 @@ async fn rotate_feed_token(
     Extension(User(email)): Extension<User>,
 ) -> Result<Response, Error> {
     let feed_token = random_hex(24);
-    state
-        .db
-        .lock()
-        .unwrap()
-        .execute("UPDATE users SET feed_token = ?1 WHERE email = ?2", params![feed_token, email])?;
+    query("UPDATE users SET feed_token = ? WHERE email = ?")
+        .bind(hash_token(&feed_token))
+        .bind(email)
+        .execute(&mut *state.db.conn().await?)
+        .await?;
     Ok(Json(json!({ "feed_token": feed_token })).into_response())
 }
 
@@ -597,18 +655,20 @@ async fn delete_account(
     Json(body): Json<DeleteAccount>,
 ) -> Result<StatusCode, Error> {
     confirm_password(&state, &email, body.password).await?;
-    let mut db = state.db.lock().unwrap();
-    let tx = db.transaction()?;
-    tx.execute(
-        "DELETE FROM calendar_members WHERE email = ?1
-         OR calendar_id IN (SELECT id FROM calendars WHERE owner = ?1)",
-        [&email],
-    )?;
+    let mut tx = state.db.begin().await?;
+    query(
+        "DELETE FROM calendar_members WHERE email = ?
+         OR calendar_id IN (SELECT id FROM calendars WHERE owner = ?)",
+    )
+    .bind(&email)
+    .bind(&email)
+    .execute(&mut *tx)
+    .await?;
     for table in ["events", "calendars"] {
-        tx.execute(&format!("DELETE FROM {table} WHERE owner = ?1"), [&email])?;
+        query(&format!("DELETE FROM {table} WHERE owner = ?")).bind(&email).execute(&mut *tx).await?;
     }
-    tx.execute("DELETE FROM sessions WHERE email = ?1", [&email])?;
-    tx.execute("DELETE FROM users WHERE email = ?1", [&email])?;
-    tx.commit()?;
+    query("DELETE FROM sessions WHERE email = ?").bind(&email).execute(&mut *tx).await?;
+    query("DELETE FROM users WHERE email = ?").bind(&email).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }

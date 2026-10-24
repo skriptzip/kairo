@@ -24,7 +24,9 @@ pub struct Session {
 struct AuthResponse {
     token: String,
     email: String,
-    feed_token: String,
+    /// Only sent at registration; the server keeps nothing but its hash.
+    #[serde(default)]
+    feed_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -65,7 +67,31 @@ pub fn normalize_server(raw: &str) -> Result<String, String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("Die Serveradresse muss mit http:// oder https:// beginnen.".into());
     }
+    if let Some(rest) = url.strip_prefix("http://") {
+        if !is_local_host(rest) {
+            return Err("Unverschlüsseltes http:// ist nur für localhost und das lokale Netz erlaubt. Bitte https:// verwenden.".into());
+        }
+    }
     Ok(url)
+}
+
+/// Loopback, private IPv4 ranges and `.local` / `.lan` names: places where plain HTTP does
+/// not cross the open internet.
+fn is_local_host(authority: &str) -> bool {
+    let authority = authority.split('/').next().unwrap_or("");
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    let host = host.to_ascii_lowercase();
+    if host == "localhost" || host == "::1" || host.ends_with(".localhost") || host.ends_with(".local") || host.ends_with(".lan") {
+        return true;
+    }
+    match host.parse::<std::net::Ipv4Addr>() {
+        Ok(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Err(_) => false,
+    }
 }
 
 fn error_message(status: u16, body: Option<ErrorBody>) -> String {
@@ -118,7 +144,7 @@ pub fn authenticate(
         return Err(error_message(status, res.body_mut().read_json().ok()));
     }
     let auth: AuthResponse = res.body_mut().read_json().map_err(|_| "Unerwartete Antwort des Servers.".to_string())?;
-    Ok(Session { server, email: auth.email, token: auth.token, feed_token: auth.feed_token })
+    Ok(Session { server, email: auth.email, token: auth.token, feed_token: auth.feed_token.unwrap_or_default() })
 }
 
 pub fn validate(session: &Session) -> Validity {
@@ -232,5 +258,10 @@ mod tests {
         assert_eq!(normalize_server("kairo.example.com").unwrap(), "https://kairo.example.com");
         assert!(normalize_server("  ").is_err());
         assert!(normalize_server("ftp://x").is_err());
+        assert!(normalize_server("http://example.com").is_err());
+        assert!(normalize_server("http://localhost:8080").is_ok());
+        assert!(normalize_server("http://192.168.1.5:8080").is_ok());
+        assert!(normalize_server("http://[::1]:8080").is_ok());
+        assert!(normalize_server("https://example.com").is_ok());
     }
 }
