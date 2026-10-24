@@ -96,6 +96,9 @@ fn parse_categories(text: &str) -> Vec<String> {
     out
 }
 
+/// The label that marks an event as a birthday.
+const BIRTHDAY_CATEGORY: &str = "Geburtstag";
+
 /// Labels offered with one click.
 const CATEGORY_PRESETS: [&str; 6] = ["Vor Ort", "Homeoffice", "Dienstreise", "Wichtig", "Besprechung", "Privat"];
 
@@ -561,6 +564,34 @@ impl EventWindow {
         }
     }
 
+    /// A birthday is an all-day event that repeats every year, marked by the category "Geburtstag".
+    fn is_birthday(&self, cx: &Context<Self>) -> bool {
+        parse_categories(self.categories_input.read(cx).value().as_ref())
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(BIRTHDAY_CATEGORY))
+    }
+
+    fn set_birthday(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let mut categories = parse_categories(self.categories_input.read(cx).value().as_ref());
+        categories.retain(|c| !c.eq_ignore_ascii_case(BIRTHDAY_CATEGORY));
+        if on {
+            categories.push(BIRTHDAY_CATEGORY.to_string());
+            self.set_all_day(true, window, cx);
+            // One day, repeating on the same date every year.
+            let day = self.start.date();
+            self.set_times(day.and_time(NaiveTime::MIN), Duration::hours(24) - Duration::minutes(1), window, cx);
+            self.repeat_index = REPEAT_CHOICES.iter().position(|(key, _)| *key == "yearly").unwrap_or(0);
+            let label = REPEAT_CHOICES[self.repeat_index].1;
+            self.repeat_select.update(cx, |select, cx| select.set_selected_value(&label.to_string(), window, cx));
+            self.month_index = 0;
+            self.month_select.update(cx, |select, cx| select.set_selected_index(Some(IndexPath::new(0)), window, cx));
+            self.until_enabled = false;
+            self.interval_input.update(cx, |input, cx| input.set_value("1", window, cx));
+        }
+        self.categories_input.update(cx, |input, cx| input.set_value(categories.join(", "), window, cx));
+        cx.notify();
+    }
+
     /// Sets the event to `start` with the given duration and brings all the pickers in line.
     fn set_times(&mut self, start: NaiveDateTime, duration: Duration, window: &mut Window, cx: &mut Context<Self>) {
         let end = start + duration;
@@ -965,6 +996,15 @@ impl EventWindow {
                     .disabled(read_only)
                     .on_click(cx.listener(|this, checked: &bool, window, cx| this.set_all_day(*checked, window, cx))),
             )
+            .when(!single, |d| {
+                d.child(
+                    Checkbox::new("birthday")
+                        .label("Geburtstag (ganztägig, jährlich)")
+                        .checked(self.is_birthday(cx))
+                        .disabled(read_only)
+                        .on_click(cx.listener(|this, checked: &bool, window, cx| this.set_birthday(*checked, window, cx))),
+                )
+            })
             .when(!all_day, |d| {
                 d.child(
                 div()

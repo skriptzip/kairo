@@ -155,6 +155,9 @@ struct EventInput {
     end_time: String,
     /// Only used for new events: `daily`, `weekly`, `monthly`, `yearly` or empty.
     repeat: String,
+    /// Only used for new events: all-day, repeating yearly, labelled "Geburtstag".
+    #[serde(default)]
+    birthday: bool,
 }
 
 fn parse_date(text: &str) -> Result<NaiveDate, String> {
@@ -309,6 +312,12 @@ fn save_event(app: State<'_, App>, input: EventInput) -> Result<(), String> {
     if title.is_empty() {
         return Err("Bitte einen Titel eingeben.".into());
     }
+    let mut input = input;
+    if input.birthday {
+        input.all_day = true;
+        input.end_date = input.start_date.clone();
+        input.repeat = "yearly".into();
+    }
     let start_date = parse_date(&input.start_date)?;
     let end_date = parse_date(&input.end_date)?;
     let (start, end) = if input.all_day {
@@ -362,7 +371,7 @@ fn save_event(app: State<'_, App>, input: EventInput) -> Result<(), String> {
                 attendees: Vec::new(),
                 color: None,
                 private: false,
-                categories: Vec::new(),
+                categories: if input.birthday { vec!["Geburtstag".to_string()] } else { Vec::new() },
                 rev: 0,
                 dirty: true,
                 draft: false,

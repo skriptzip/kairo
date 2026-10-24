@@ -392,6 +392,19 @@ function updateAllDay() {
 }
 $("e-allday").addEventListener("change", updateAllDay);
 
+// A birthday is an all-day event on one day that repeats every year.
+$("e-birthday").addEventListener("change", () => {
+  const on = $("e-birthday").checked;
+  if (on) {
+    $("e-allday").checked = true;
+    $("e-edate").value = $("e-sdate").value;
+    $("e-repeat").value = "yearly";
+  }
+  $("e-allday").disabled = on;
+  $("e-repeat").disabled = on;
+  updateAllDay();
+});
+
 // Keep the end from falling before the start while editing.
 $("e-sdate").addEventListener("change", () => {
   if ($("e-edate").value < $("e-sdate").value) $("e-edate").value = $("e-sdate").value;
@@ -433,6 +446,9 @@ function openEdit(item) {
   $("e-etime").value = timeOf(v.end);
   $("e-repeat").value = "";
   $("e-repeat-row").hidden = !!item;
+  $("e-birthday").checked = false;
+  $("e-birthday-row").hidden = !!item;
+  $("e-repeat").disabled = false;
   $("e-note").hidden = !v.series;
   for (const id of ["e-allday", "e-calendar", "e-sdate", "e-stime", "e-edate", "e-etime"]) $(id).disabled = !!v.series;
   updateAllDay();
@@ -456,6 +472,7 @@ $("edit").addEventListener("submit", async (event) => {
         endDate: $("e-edate").value,
         endTime: $("e-etime").value || "00:00",
         repeat: $("e-repeat").value,
+        birthday: $("e-birthday").checked,
       },
     });
     closeSheet();
