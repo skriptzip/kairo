@@ -112,17 +112,6 @@ impl AuthState {
     }
 }
 
-/// Databases created when accounts still had usernames: the columns are renamed in place.
-pub async fn migrate_username_to_email(conn: &mut Conn) -> db::Result<()> {
-    for table in ["users", "sessions", "calendar_members"] {
-        if db::sqlite_has_column(conn, table, "username").await? {
-            query(&format!("ALTER TABLE {table} RENAME COLUMN username TO email")).execute(&mut *conn).await?;
-        }
-    }
-    query("DROP INDEX IF EXISTS sessions_username").execute(conn).await?;
-    Ok(())
-}
-
 pub async fn init_db(conn: &mut Conn) -> db::Result<()> {
     db::create_table(
         conn,
@@ -139,24 +128,7 @@ pub async fn init_db(conn: &mut Conn) -> db::Result<()> {
          expires_at BIGINT NOT NULL",
     )
     .await?;
-    db::create_index(conn, "sessions_email", "sessions", "email").await?;
-    hash_plain_feed_tokens(conn).await
-}
-
-/// Feed tokens used to be stored as given (48 hex chars); hashes are 64.
-async fn hash_plain_feed_tokens(conn: &mut Conn) -> db::Result<()> {
-    let rows = query("SELECT email, feed_token FROM users").fetch_all(&mut *conn).await?;
-    for row in &rows {
-        let token = s(row, 1)?;
-        if token.len() != 64 {
-            query("UPDATE users SET feed_token = ? WHERE email = ?")
-                .bind(hash_token(&token))
-                .bind(s(row, 0)?)
-                .execute(&mut *conn)
-                .await?;
-        }
-    }
-    Ok(())
+    db::create_index(conn, "sessions_email", "sessions", "email").await
 }
 
 // ---------------------------------------------------------------------------------------

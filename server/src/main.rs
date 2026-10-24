@@ -1241,60 +1241,6 @@ mod tests {
         assert_eq!(delta["events"][0]["deleted"], true);
     }
 
-    /// An SQLite file written by an older version, upgraded by `db::init`. Only SQLite ever
-    /// had older versions, so these are skipped when testing another database.
-    async fn old_sqlite(statements: &[&str]) -> Option<Db> {
-        if std::env::var("TEST_DATABASE_URL").is_ok() {
-            return None;
-        }
-        let db = Db::open("sqlite::memory:").await.unwrap();
-        let mut conn = db.conn().await.unwrap();
-        for statement in statements {
-            sqlx::query(statement).execute(&mut *conn).await.unwrap();
-        }
-        db::init(&mut conn).await.unwrap();
-        db::init(&mut conn).await.unwrap(); // running it again is harmless
-        drop(conn);
-        Some(db)
-    }
-
-    #[tokio::test]
-    async fn old_database_gets_status_column() {
-        let Some(db) = old_sqlite(&[
-            "CREATE TABLE events (
-                 id TEXT PRIMARY KEY, owner TEXT NOT NULL, calendar_id TEXT NOT NULL,
-                 title TEXT NOT NULL, location TEXT NOT NULL, description TEXT NOT NULL,
-                 starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, tz TEXT NOT NULL,
-                 rev INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0)",
-            "INSERT INTO events VALUES ('e1','a','c1','t','','','2026-10-05T09:00:00','2026-10-05T10:00:00','Europe/Berlin',1,0)",
-        ])
-        .await
-        else {
-            return;
-        };
-        let mut conn = db.conn().await.unwrap();
-        let row = query("SELECT status, `repeat` FROM events WHERE id = 'e1'").fetch_one(&mut *conn).await.unwrap();
-        assert_eq!(s(&row, 0).unwrap(), "busy");
-        assert_eq!(s(&row, 1).unwrap(), "");
-    }
-
-    #[tokio::test]
-    async fn old_database_gets_email_columns() {
-        let Some(db) = old_sqlite(&[
-            "CREATE TABLE users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, feed_token TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL)",
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, username TEXT NOT NULL, device TEXT NOT NULL, created_at INTEGER NOT NULL, last_used INTEGER NOT NULL, expires_at INTEGER NOT NULL)",
-            "CREATE INDEX sessions_username ON sessions (username)",
-            "INSERT INTO users VALUES ('alice','h','f',1)",
-        ])
-        .await
-        else {
-            return;
-        };
-        let mut conn = db.conn().await.unwrap();
-        let row = query("SELECT email FROM users").fetch_one(&mut *conn).await.unwrap();
-        assert_eq!(s(&row, 0).unwrap(), "alice");
-    }
-
     #[tokio::test]
     async fn event_status_is_stored_and_validated() {
         let app = app().await;

@@ -29,7 +29,7 @@ Environment variables:
 | `KAIRO_INVITE_CODE` | – | Required at registration if set |
 | `KAIRO_TRUST_PROXY` | `0` | `1` behind a reverse proxy that sets `X-Forwarded-For` |
 
-Tables are created and upgraded on start. Switching databases starts empty; data is not migrated.
+Tables are created on start. Switching databases starts empty; data is not migrated.
 
 ## Test
 
@@ -45,7 +45,7 @@ The test database is wiped first.
 - **TLS:** Der Server spricht nur HTTP. Für Zugriff von außen immer einen TLS-Reverse-Proxy davorsetzen und `KAIRO_TRUST_PROXY=1` setzen. Die Compose-Dateien binden den Port bewusst nur an `127.0.0.1`. Die Clients lehnen `http://` für Hosts außerhalb von localhost/lokalem Netz ab.
 - **Registrierung:** Nach dem Anlegen der Konten `KAIRO_REGISTRATION=closed` setzen oder einen `KAIRO_INVITE_CODE` verlangen.
 - **Anfragegröße:** Request-Bodies sind auf 256 KiB begrenzt.
-- **Kalender-Feed (`/ics/{id}?token=…`):** Das Feed-Token ist ein Zugangsschlüssel mit Lesezugriff auf *alle* Kalender des Kontos. Der Server speichert nur den SHA-256-Hash; das Token wird einmalig bei der Registrierung bzw. beim Erneuern (`POST /api/v1/auth/feed-token`) ausgegeben, bestehende Klartext-Tokens werden beim Start automatisch gehasht. Die URL wie ein Passwort behandeln und bei Verdacht erneuern. Falsche Tokens werden pro IP begrenzt (30 pro 15 Min.). Proxy-Logs sollten die Query-Strings von `/ics/` nicht aufzeichnen.
+- **Kalender-Feed (`/ics/{id}?token=…`):** Das Feed-Token ist ein Zugangsschlüssel mit Lesezugriff auf *alle* Kalender des Kontos. Der Server speichert nur den SHA-256-Hash; das Token wird einmalig bei der Registrierung bzw. beim Erneuern (`POST /api/v1/auth/feed-token`) ausgegeben. Die URL wie ein Passwort behandeln und bei Verdacht erneuern. Falsche Tokens werden pro IP begrenzt (30 pro 15 Min.). Proxy-Logs sollten die Query-Strings von `/ics/` nicht aufzeichnen.
 - **Sitzungs-Tokens** werden dagegen nur als SHA-256-Hash gespeichert.
 - **Rate-Limit:** Die Login-/Registrierungs-Limits liegen im Arbeitsspeicher und werden bei einem Neustart zurückgesetzt. Hinter einem Proxy ohne `KAIRO_TRUST_PROXY=1` zählen alle Anfragen als eine IP; mit `KAIRO_TRUST_PROXY=1` ohne Proxy kann die IP über `X-Forwarded-For` gefälscht werden. Die Einstellung muss zur Umgebung passen.
 - **E-Mail-Enumeration:** Registrierung (409) und Einladungen (404) verraten, ob eine Adresse registriert ist. Das ist bei einem kleinen privaten Server gewollt (Einladen setzt es voraus); bei öffentlicher Registrierung `KAIRO_REGISTRATION=closed` oder einen Einladungscode nutzen.
